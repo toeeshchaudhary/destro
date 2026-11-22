@@ -38,8 +38,10 @@ IN THE TUI
   /close            close the current workspace
   Ctrl+S            snippet viewer     F1  all keys
 OPTIONS
-  --provider <id>   provider route (default deepseek-official)
-  --model <id>      model (default deepseek-v4-pro)
+  --provider <id>   provider route (default: first configured provider, else mock)
+  --model <id>      model (default: the provider's default)
+  update            self-update from the latest GitHub release
+  providers         list providers and exit
   --snapshot [done|snippets|open]
                     render a demo frame to stdout and exit
   --bench <N>       ingest N synthetic events, time rendering, exit
@@ -47,8 +49,9 @@ OPTIONS
   --advisor         start in advisor mode (prompts for planner + worker models)
   --advisor-model <id>  advisor model, skips its picker field
   --slave-model <id>    worker model, skips its picker field
-  --update          self-update from the latest GitHub release
-  --providers       list providers and exit
+  --update          same as `update`
+  --providers       same as `providers`
+  --version         print the version and exit
 ENV
   DEEPSEEK_API_KEY  enables the balance readout (env or .env)
 ";
@@ -115,8 +118,12 @@ fn parse_args() -> Result<Args> {
             "--advisor" => a.advisor = true,
             "--advisor-model" => a.advisor_model = it.next(),
             "--slave-model" => a.slave_model = it.next(),
-            "--update" => a.update = true,
-            "--providers" => a.providers = true,
+            "--update" | "update" => a.update = true,
+            "--providers" | "providers" => a.providers = true,
+            "--version" | "-V" => {
+                println!("destro {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
             "-h" | "--help" => {
                 print!("{USAGE}");
                 std::process::exit(0);
