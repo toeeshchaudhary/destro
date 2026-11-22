@@ -334,13 +334,10 @@ impl AgentHandle {
 
     /// Queue or inject a message. `Inject` preempts the in-flight request.
     pub fn send(&self, text: impl Into<String>, mode: Delivery) -> Result<(), &'static str> {
-        self.tx
-            .try_send(Command::Send {
-                text: text.into(),
-                mode,
-            })
-            .map_err(|_| "agent mailbox is full")?;
+        let text = text.into();
+        let permit = self.tx.try_reserve().map_err(|_| "agent mailbox is full")?;
         self.live.queued.fetch_add(1, Ordering::Relaxed);
+        permit.send(Command::Send { text, mode });
         Ok(())
     }
 
