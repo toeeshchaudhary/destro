@@ -21,8 +21,10 @@ workspace, so the nearest file reads as the most specific:
 * Each chain is capped at 64 KiB; the cut is marked in the prompt.
 * `/context` shows exactly which files are in use.
 
-Not done yet: nested `AGENTS.md` files in sub-directories the agent reads into
-later (they are only loaded if they sit on the path to the workspace).
+**Nested files:** an `AGENTS.md` / `CLAUDE.md` in a sub-folder below the workspace is
+delivered the first time a tool touches a path in that folder: it rides along
+with that tool's result (once per session), so the agent sees `pkg/AGENTS.md`
+when it first reads `pkg/lib.rs`.
 
 ## Skills
 
@@ -63,8 +65,16 @@ workspace) and `~/.destro/mcp.json`. The format matches other tools:
 ```
 
 `${VAR}` and `${VAR:-default}` expand in commands, args, URLs, headers and env.
-Stdio and streamable-HTTP transports work; tools appear as `mcp__<server>__<tool>`.
-Resources and prompts are not used yet.
+Stdio, streamable-HTTP and the older HTTP+SSE (`"type": "sse"`) transports work.
+
+* **Tools** appear as `mcp__<server>__<tool>` and refresh live when the server
+  announces `notifications/tools/list_changed`.
+* **Resources**: servers that offer them get `mcp__<server>__list_resources` and
+  `__read_resource` tools.
+* **Prompts** show up in the `/` popup as `/mcp:<server>:<prompt>`; arguments are
+  `key=value` or positional.
+* **Auth**: put a token in `headers`. OAuth login flows are not supported; a
+  401/403 says so instead of dumping the response.
 
 **Trust:** a project's `.mcp.json` can launch arbitrary commands, so each
 project-scope server waits for approval once (`/mcp`, Enter). The decision is
@@ -73,10 +83,34 @@ remembered in `mcp-trust.json`. User-scope servers start on their own.
 
 ## Sessions
 
-Every root session is saved as it happens to
-`%APPDATA%\destro\sessions\<workspace>\<id>.jsonl` (`~/.config/destro/…` elsewhere)
-and `/resume` (Alt+R) reopens one with its full conversation. `/export` writes the
-current session to Markdown. Prompt history (Up/Down) persists too.
+Every session is saved as it happens to
+`%APPDATA%\destro\sessions\<workspace>\<id>.jsonl` (`~/.config/destro/…` elsewhere);
+subagent sessions are filed beside their root as `<root>.sub.<child>.jsonl`.
+
+* `/resume` (Alt+R) reopens one with its full conversation, its subagent tree and, for
+  advisor sessions, advisor mode. In that list: Ctrl+R renames, Ctrl+F forks, Ctrl+D
+  deletes (press twice).
+* `/search <words>` searches the text of every saved session in every workspace and
+  opens the hit (opening its workspace if needed).
+* `/rename <title>`, `/fork` (continue a copy independently), `/export` (Markdown).
+* Prompt history (Up/Down) persists too.
+
+## Approvals, questions, compaction
+
+* **Approvals** are a toggle: `/approvals` (remembered between runs). When on, the
+  shell, file writes and edits, and MCP tools wait for **y** allow once, **a** always
+  (this run) or **n** reject. Off by default.
+* **`ask_user`**: the model can stop and ask you a question; you pick an option or
+  type an answer, or Esc to skip.
+* **Compaction**: when a request's context passes 100k tokens, older messages are folded
+  into one summary and the last couple of turns are kept verbatim. `/compact` does it
+  on demand. Resuming a compacted session replays the compaction.
+
+## Web and planning tools
+
+`web_search` works without a key (DuckDuckGo); set `BRAVE_API_KEY`, `TAVILY_API_KEY`
+or `SEARXNG_URL` to use one of those instead. `web_fetch` reads a URL as text.
+`todo_write` keeps a visible checklist for multi-step work.
 
 ## Importing DeepSeek Harness chats
 
@@ -86,15 +120,21 @@ destro import-dsh             # import every root chat
 destro import-dsh --force     # re-import (overwrites earlier imports)
 ```
 
-or `/import` inside the TUI to pick workspaces and chats. dsh logs
+or `/import` inside the TUI to pick workspaces and chats (imports run on all cores).
+dsh logs
 (`~/.dsh/sessions/<workspace>/<id>/session.v4.jsonl.zstd`) are converted to
 Destro sessions under the same workspace path, keeping prompts, assistant text
 and reasoning, tool calls and results, titles and token usage. dsh bookkeeping
 (runtime-context snapshots, skill catalogues, sandbox/approval records, jobs) is
-dropped, and subagent sessions are folded into their parent's tool calls. Images
-become `[image]`. Imported chats can be resumed and continued on any model.
+dropped. Subagent sessions are imported as child sessions of the chat that spawned
+them (nested ones keep their nesting), original timestamps are kept, and images
+become `[image: <path>]` pointing at dsh's attachment store. Imported chats resume
+on the workspace's current model.
 
 ## Models
 
 `/model` (Alt+M) switches the current session and every new one in the workspace;
 type any `provider/model` route. Routes for configured providers are listed.
+`/provider` lists every provider; picking one that has no key asks for it and stores
+it in `keys.json` in your Destro config (an environment variable still wins), and the
+provider becomes usable immediately in running sessions.

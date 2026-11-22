@@ -25,6 +25,7 @@ use destro_tools::{Registry, ToolContext, ToolInvocation};
 
 use crate::bus::{EventBus, HarnessEvent};
 use crate::gate::{Gate, Priority};
+use crate::interact::{Decision, Interact};
 use crate::provider::{Provider, ProviderError, ProviderItem};
 
 /// Mailbox depth per agent. Deep enough to absorb a burst of steering, shallow
@@ -292,9 +293,14 @@ impl Live {
 // ---------------------------------------------------------------------------
 
 pub(crate) enum Command {
-    Send { text: String, mode: Delivery },
+    Send {
+        text: String,
+        mode: Delivery,
+    },
     Interrupt,
     SetModel(String),
+    /// Fold older history into a summary now.
+    Compact,
     Kill,
     State(oneshot::Sender<AgentState>),
 }
@@ -345,6 +351,11 @@ impl AgentHandle {
 
     pub fn set_model(&self, model: impl Into<String>) {
         let _ = self.tx.try_send(Command::SetModel(model.into()));
+    }
+
+    /// Summarise older messages to free context.
+    pub fn compact(&self) {
+        let _ = self.tx.try_send(Command::Compact);
     }
 
     /// Stop the agent and every descendant.
@@ -400,6 +411,8 @@ pub(crate) struct AgentInit {
     pub priority: Priority,
     pub history: Vec<Value>,
     pub providers: Option<Arc<crate::harness::ProviderSet>>,
+    pub interact: Arc<Interact>,
+    pub compact_at: u64,
 }
 
 pub(crate) struct AgentTask {
@@ -420,6 +433,11 @@ pub(crate) struct AgentTask {
     messages: Vec<Value>,
     turn: u32,
     providers: Option<Arc<crate::harness::ProviderSet>>,
+    interact: Arc<Interact>,
+    compact_at: u64,
+    /// Context size of the latest request: drives automatic compaction.
+    ctx_tokens: u64,
+    nested_seen: Mutex<std::collections::HashSet<PathBuf>>,
 }
 
 struct TurnOutcome {
@@ -447,6 +465,10 @@ impl AgentTask {
             messages: init.history,
             turn: 0,
             providers: init.providers,
+            interact: init.interact,
+            compact_at: init.compact_at,
+            ctx_tokens: 0,
+            nested_seen: Mutex::new(Default::default()),
         }
     }
 
@@ -482,6 +504,10 @@ impl AgentTask {
                             break;
                         }
                         Command::SetModel(model) => self.switch_model(model),
+                        Command::Compact => {
+                            let c = self.cancel.child_token();
+                            self.compact(&c).await;
+                        }
                         Command::State(tx) => {
                             let _ = tx.send(self.live.snapshot(self.id));
                         }
@@ -538,6 +564,7 @@ impl AgentTask {
                                 inbox.push(Command::Kill);
                             }
                             Some(Command::SetModel(m)) => inbox.push(Command::SetModel(m)),
+                            Some(Command::Compact) => inbox.push(Command::Compact),
                             Some(Command::State(tx)) => {
                                 let _ = tx.send(live.snapshot(id));
                             }
@@ -558,6 +585,10 @@ impl AgentTask {
                 match cmd {
                     Command::Send { text, .. } => pending.push_back(text),
                     Command::SetModel(m) => self.switch_model(m),
+                    Command::Compact => {
+                        let c = self.cancel.child_token();
+                        self.compact(&c).await;
+                    }
                     Command::Kill => {
                         self.cancel.cancel();
                         kill_requested = true;
@@ -660,6 +691,9 @@ impl AgentTask {
                     notice: None,
                 };
             }
+            if self.compact_at > 0 && self.ctx_tokens >= self.compact_at {
+                self.compact(cancel).await;
+            }
             steps += 1;
             if steps > self.max_steps {
                 return TurnOutcome {
@@ -728,6 +762,9 @@ impl AgentTask {
             }
             if !usage_flat(&usage) {
                 self.live.add_usage(&usage);
+            }
+            if usage.context_tokens() > 0 {
+                self.ctx_tokens = usage.context_tokens();
             }
             if !text.is_empty() || !reasoning.is_empty() || !calls.is_empty() || interrupted {
                 self.emit(SessionEvent::AssistantMessage {
@@ -855,6 +892,32 @@ impl AgentTask {
             Ok(v) => v,
             Err(e) => return Err(ToolFail::Invalid(e.to_string())),
         };
+        if self.interact.approvals_on()
+            && Interact::needs_approval(name)
+            && !self.interact.is_allowed(name)
+        {
+            let (id, rx) = self.interact.request_approval(name);
+            self.bus.publish(HarnessEvent::Approval {
+                id,
+                agent: self.id,
+                tool: name.to_string(),
+                summary: summarize_call(name, &args),
+            });
+            let decision = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    self.interact.forget_approval(id);
+                    return Err(ToolFail::Interrupted);
+                }
+                d = rx => d.unwrap_or(Decision::Reject),
+            };
+            if decision == Decision::Reject {
+                return Ok((
+                    "rejected by the user; do not retry the same action".into(),
+                    true,
+                ));
+            }
+        }
         let invocation = ToolInvocation {
             call_id: call_id.to_string(),
             arguments: args,
@@ -864,17 +927,212 @@ impl AgentTask {
             agent_id: self.id.wire(),
         };
         let fut = tool.run(&invocation, &context);
-        tokio::select! {
+        let out = tokio::select! {
             biased;
-            _ = cancel.cancelled() => Err(ToolFail::Interrupted),
-            out = fut => Ok(if out.is_error { (format!("error: {}", out.content), true) } else { (out.content, false) }),
+            _ = cancel.cancelled() => return Err(ToolFail::Interrupted),
+            out = fut => out,
+        };
+        if out.is_error {
+            return Ok((format!("error: {}", out.content), true));
         }
+        let mut content = out.content;
+        content.push_str(&self.nested_instructions_for(&invocation.arguments));
+        Ok((content, false))
+    }
+
+    /// Sub-folder `AGENTS.md` files that apply to the path a tool just touched,
+    /// appended to its result the first time that part of the tree is entered.
+    fn nested_instructions_for(&self, args: &Value) -> String {
+        let Some(path) = ["path", "file_path", "file", "filename"]
+            .iter()
+            .find_map(|k| args[*k].as_str())
+        else {
+            return String::new();
+        };
+        let mut seen = self.nested_seen.lock();
+        let found =
+            crate::context::nested_instructions(&self.cwd, std::path::Path::new(path), &mut seen);
+        let mut out = String::new();
+        for (file, text) in found {
+            out.push_str(&format!(
+                "\n\n<nested-instructions source=\"{}\">\n{}\n</nested-instructions>",
+                file.display(),
+                text.trim_end()
+            ));
+        }
+        out
+    }
+
+    /// Fold everything before the last couple of user turns into one summary
+    /// message. Returns whether anything changed.
+    async fn compact(&mut self, cancel: &CancellationToken) -> bool {
+        let Some(tail_start) = compact_split(&self.messages) else {
+            return false;
+        };
+        self.emit(SessionEvent::CompactionStart);
+        let transcript = render_transcript(&self.messages[..tail_start]);
+        let request = crate::provider::ChatRequest {
+            model: self.model.clone(),
+            system: SUMMARY_SYSTEM.to_string(),
+            messages: vec![json!({
+                "role": "user",
+                "content": format!("{transcript}\n\n---\nWrite the summary now."),
+            })],
+            tools: vec![],
+            max_tokens: self.max_tokens,
+        };
+        let gate = self.gate.clone();
+        let permit = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return false,
+            p = gate.acquire(self.priority) => p,
+        };
+        let mut stream = self.provider.stream(request, cancel.clone());
+        let mut summary = String::new();
+        let mut failure: Option<String> = None;
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                item = stream.next() => match item {
+                    None => break,
+                    Some(Ok(ProviderItem::TextDelta(t))) => summary.push_str(&t),
+                    Some(Ok(_)) => {}
+                    Some(Err(ProviderError::Cancelled)) => break,
+                    Some(Err(e)) => { failure = Some(e.to_string()); break; }
+                }
+            }
+        }
+        drop(permit);
+        let summary = summary.trim().to_string();
+        if summary.is_empty() || failure.is_some() {
+            let why = failure.unwrap_or_else(|| "empty summary".into());
+            self.emit(SessionEvent::Notice {
+                text: format!("compaction failed: {why}"),
+            });
+            // an agent that cannot compact must not retry on every request
+            self.ctx_tokens = 0;
+            return false;
+        }
+        let tail = self.messages.split_off(tail_start);
+        let keep = tail.len();
+        self.messages = vec![json!({
+            "role": "user",
+            "content": format!("{}{}", crate::store::SUMMARY_PREFIX, summary),
+        })];
+        self.messages.extend(tail);
+        self.ctx_tokens = 0;
+        self.emit(SessionEvent::CompactionEnd { summary, keep });
+        true
     }
 }
 
 enum ToolFail {
     Interrupted,
     Invalid(String),
+}
+
+const SUMMARY_SYSTEM: &str = "You compress an AI coding agent's conversation so it can continue \
+with less context. Write a dense, factual summary in Markdown, under 800 words, that keeps: the \
+user's goals and constraints, decisions made and why, files created or changed (with paths), \
+commands run and their outcomes, errors hit and how they were resolved, and what is still open. \
+Do not address the user. Do not invent anything.";
+
+/// Index where the kept tail starts: the last two user turns, or, when one turn
+/// holds nearly everything (a long tool loop), the last ten messages from an
+/// assistant boundary. `None` when there is too little to be worth folding.
+fn compact_split(messages: &[Value]) -> Option<usize> {
+    if messages.len() < 8 {
+        return None;
+    }
+    let users: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m["role"] == "user")
+        .map(|(i, _)| i)
+        .collect();
+    let by_turns = (users.len() >= 2).then(|| users[users.len() - 2]);
+    let start = match by_turns {
+        Some(i) if i >= messages.len() / 3 => i,
+        _ => {
+            let from = messages.len().saturating_sub(10);
+            (from..messages.len()).find(|&i| messages[i]["role"] == "assistant")?
+        }
+    };
+    (start >= 3).then_some(start)
+}
+
+fn render_transcript(messages: &[Value]) -> String {
+    let mut out = String::new();
+    for m in messages {
+        let text = match &m["content"] {
+            Value::String(s) => s.clone(),
+            Value::Array(a) => a
+                .iter()
+                .filter_map(|b| b["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        };
+        match m["role"].as_str().unwrap_or("") {
+            "user" => out.push_str(&format!("USER: {text}\n\n")),
+            "assistant" => {
+                out.push_str(&format!("ASSISTANT: {text}\n"));
+                for c in m["tool_calls"].as_array().into_iter().flatten() {
+                    let args: String = c["function"]["arguments"]
+                        .as_str()
+                        .unwrap_or("")
+                        .chars()
+                        .take(300)
+                        .collect();
+                    out.push_str(&format!(
+                        "  [called {}({args})]\n",
+                        c["function"]["name"].as_str().unwrap_or("?")
+                    ));
+                }
+                out.push('\n');
+            }
+            "tool" => {
+                let t: String = text.chars().take(600).collect();
+                out.push_str(&format!(
+                    "TOOL RESULT ({}): {t}\n\n",
+                    m["name"].as_str().unwrap_or("?")
+                ));
+            }
+            _ => {}
+        }
+    }
+    const CAP: usize = 100_000;
+    if out.len() > CAP {
+        let mut cut = out.len() - CAP;
+        while !out.is_char_boundary(cut) {
+            cut += 1;
+        }
+        out = format!("[earlier part omitted]\n{}", &out[cut..]);
+    }
+    out
+}
+
+/// One line describing what a tool call is about to do, for the approval prompt.
+fn summarize_call(name: &str, args: &Value) -> String {
+    let pick = |keys: &[&str]| {
+        keys.iter()
+            .find_map(|k| args[*k].as_str().map(str::to_string))
+    };
+    let s = match name {
+        "pwsh" => pick(&["command"]),
+        "write" | "edit" => pick(&["path", "file_path"]),
+        _ => None,
+    }
+    .unwrap_or_else(|| args.to_string());
+    let flat = s.replace('\n', " ⏎ ");
+    if flat.chars().count() > 300 {
+        let mut t: String = flat.chars().take(300).collect();
+        t.push('…');
+        t
+    } else {
+        flat
+    }
 }
 
 fn first_line(text: &str, max: usize) -> String {

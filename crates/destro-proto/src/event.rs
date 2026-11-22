@@ -78,6 +78,14 @@ pub enum SessionEvent {
     ContextWindow {
         window: u64,
     },
+    /// Older messages are being folded into a summary.
+    CompactionStart,
+    /// The fold finished: `summary` replaces everything before the last
+    /// `keep` messages.
+    CompactionEnd {
+        summary: String,
+        keep: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -203,6 +211,14 @@ impl SessionEvent {
                 "type": "request/context",
                 "data": { "contextWindow": window },
             }),
+            SessionEvent::CompactionStart => json!({
+                "type": "compaction/start",
+                "data": {},
+            }),
+            SessionEvent::CompactionEnd { summary, keep } => json!({
+                "type": "compaction/end",
+                "data": { "summary": summary, "keep": keep },
+            }),
         }
     }
 
@@ -217,6 +233,8 @@ impl SessionEvent {
             SessionEvent::Notice { .. } => "notice",
             SessionEvent::SessionTitle { .. } => "session/title",
             SessionEvent::ContextWindow { .. } => "request/context",
+            SessionEvent::CompactionStart => "compaction/start",
+            SessionEvent::CompactionEnd { .. } => "compaction/end",
         }
     }
 }

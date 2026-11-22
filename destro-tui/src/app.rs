@@ -9,10 +9,11 @@ use std::time::{Duration, Instant};
 
 use crate::backend::{Backend, Msg, ProjectSpec};
 use crate::balance::Balance;
-use crate::model::{Approval, Conn, Item, Project, Status};
+use crate::model::{Approval, Conn, Item, Project, Question, Status};
 use crate::panel::{self, Kind, Panel, Tone};
 use crate::theme;
 use crate::ui::wrap;
+use std::collections::HashMap;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Row {
@@ -57,13 +58,49 @@ pub const COMMANDS: &[Cmd] = &[
     Cmd {
         name: "/resume",
         keys: "Alt+R",
-        desc: "continue a saved session",
+        desc: "continue a saved session (Ctrl+D delete · Ctrl+R rename · Ctrl+F fork)",
+        arg: false,
+    },
+    Cmd {
+        name: "/search",
+        keys: "",
+        desc: "search every saved session's text: /search <words>",
+        arg: true,
+    },
+    Cmd {
+        name: "/rename",
+        keys: "",
+        desc: "rename this session",
+        arg: true,
+    },
+    Cmd {
+        name: "/fork",
+        keys: "",
+        desc: "continue a copy of this session on its own",
+        arg: false,
+    },
+    Cmd {
+        name: "/compact",
+        keys: "",
+        desc: "summarise older messages to free context",
         arg: false,
     },
     Cmd {
         name: "/model",
         keys: "Alt+M",
         desc: "switch model or provider (or /model <route>)",
+        arg: false,
+    },
+    Cmd {
+        name: "/provider",
+        keys: "",
+        desc: "pick a provider; enter its API key if needed",
+        arg: false,
+    },
+    Cmd {
+        name: "/approvals",
+        keys: "",
+        desc: "toggle: ask before shell, writes and MCP tools",
         arg: false,
     },
     Cmd {
@@ -175,6 +212,8 @@ pub enum EntryKind {
     Builtin,
     Skill,
     Command,
+    /// An MCP server's prompt template.
+    Prompt,
 }
 
 /// One row of the `/` popup or palette: a built-in, a skill, or a custom command.
@@ -236,6 +275,26 @@ impl Default for AdvisorSetup {
     }
 }
 
+/// What a single-line text box is collecting.
+pub enum TextPurpose {
+    /// An API key for `provider`, kept under `env`; `model` is selected after.
+    ApiKey {
+        provider: String,
+        env: String,
+        model: String,
+    },
+    /// A new title for the session stored at `path`.
+    Rename { path: String, sid: String },
+}
+
+pub struct TextBox {
+    pub title: String,
+    pub hint: String,
+    pub value: String,
+    pub secret: bool,
+    pub purpose: TextPurpose,
+}
+
 pub struct App {
     pub projects: Vec<Project>,
     pub cur_project: usize,
@@ -270,6 +329,13 @@ pub struct App {
     pub dsh: Vec<destro_core::dsh::DshWorkspace>,
     /// Channel back into the main loop for background work (imports).
     pub tx: Option<std::sync::mpsc::Sender<Msg>>,
+    pub textbox: Option<TextBox>,
+    /// Ask before running shell, file-writing and MCP tools.
+    pub approvals: bool,
+    /// Highlighted option and typed answer of the `ask_user` modal.
+    pub q_sel: usize,
+    pub q_input: String,
+    confirm_delete: Option<String>,
     pub history: Vec<String>,
     hist_pos: Option<usize>,
     hist_draft: String,
@@ -311,6 +377,11 @@ impl App {
             panel: None,
             dsh: vec![],
             tx: None,
+            textbox: None,
+            approvals: false,
+            q_sel: 0,
+            q_input: String::new(),
+            confirm_delete: None,
             history: vec![],
             hist_pos: None,
             hist_draft: String::new(),
@@ -495,8 +566,20 @@ impl App {
                 self.modal_hidden = false;
             }
             "user-question/ask" => {
-                // not implemented yet: dismissal is explicitly "not approval" in the protocol
-                self.backend.send(pi, json!({"jsonrpc":"2.0","id":v["id"],"result":{"cancelled":true}}));
+                let first = self.projects[pi].questions.is_empty();
+                self.projects[pi].questions.push_back(Question {
+                    rpc_id: v["id"].clone(),
+                    session_id: params["sessionId"].as_str().unwrap_or("").into(),
+                    question: params["question"].as_str().unwrap_or("?").into(),
+                    options: params["options"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(|o| o.as_str().map(str::to_string)).collect())
+                        .unwrap_or_default(),
+                });
+                if first {
+                    self.q_sel = 0;
+                    self.q_input.clear();
+                }
             }
             _ => self.backend.send(pi, json!({"jsonrpc":"2.0","id":v["id"],"error":{"code":-32601,"message":"method not found"}})),
         }
@@ -580,15 +663,70 @@ impl App {
         }
     }
 
-    fn answer(&mut self, allow: bool) {
+    fn answer(&mut self, outcome: &str) {
         let p = self.cur_project;
         if let Some(a) = self.projects[p].approvals.pop_front() {
-            let outcome = if allow { "allowed-once" } else { "rejected" };
             self.backend.send(
                 p,
                 json!({"jsonrpc":"2.0","id":a.rpc_id,"result":{"outcome":outcome}}),
             );
         }
+    }
+
+    /// The question the current workspace is waiting on, if any.
+    pub fn pending_question(&self) -> Option<&Question> {
+        self.projects[self.cur_project].questions.front()
+    }
+
+    fn question_key(&mut self, k: KeyEvent) {
+        let p = self.cur_project;
+        let Some(q) = self.projects[p].questions.front() else {
+            return;
+        };
+        let n = q.options.len();
+        match k.code {
+            KeyCode::Up if n > 0 => {
+                self.q_sel = (self.q_sel + n - 1) % n;
+                self.q_input.clear();
+            }
+            KeyCode::Down | KeyCode::Tab if n > 0 => {
+                self.q_sel = (self.q_sel + 1) % n;
+                self.q_input.clear();
+            }
+            KeyCode::Backspace => {
+                self.q_input.pop();
+            }
+            KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.q_input.push(c)
+            }
+            KeyCode::Esc => self.finish_question(None),
+            KeyCode::Enter => {
+                let typed = self.q_input.trim().to_string();
+                let answer = if !typed.is_empty() {
+                    Some(typed)
+                } else {
+                    q.options.get(self.q_sel).cloned()
+                };
+                if answer.is_some() {
+                    self.finish_question(answer);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn finish_question(&mut self, answer: Option<String>) {
+        let p = self.cur_project;
+        if let Some(q) = self.projects[p].questions.pop_front() {
+            let result = match answer {
+                Some(a) => json!({ "answer": a }),
+                None => json!({ "cancelled": true }),
+            };
+            self.backend
+                .send(p, json!({"jsonrpc":"2.0","id":q.rpc_id,"result":result}));
+        }
+        self.q_sel = 0;
+        self.q_input.clear();
     }
 
     // ----- advisor mode -----------------------------------------------------------------
@@ -720,6 +858,15 @@ impl App {
                 desc: k.description.clone(),
                 arg: true,
                 kind: EntryKind::Skill,
+            });
+        }
+        for pm in self.backend.mcp_prompts(self.cur_project) {
+            v.push(Entry {
+                name: format!("/mcp:{}:{}", pm.server, pm.name),
+                keys: "mcp prompt".into(),
+                desc: pm.description.clone(),
+                arg: !pm.arguments.is_empty(),
+                kind: EntryKind::Prompt,
             });
         }
         let mut seen = std::collections::HashSet::new();
@@ -883,6 +1030,20 @@ impl App {
             "/context" => self.open_context_panel(),
             "/import" => self.open_import_panel(),
             "/export" => self.export_session(),
+            "/approvals" => self.toggle_approvals(),
+            "/compact" => self.compact_current(),
+            "/provider" => self.open_provider_panel(),
+            "/fork" => self.fork_current(),
+            "/rename" => self.rename_prompt(),
+            _ if text.starts_with("/rename ") => {
+                let title = text["/rename ".len()..].trim().to_string();
+                self.rename_current(&title);
+            }
+            "/search" => self.flash("usage: /search <words>".into()),
+            _ if text.starts_with("/search ") => {
+                let q = text["/search ".len()..].trim().to_string();
+                self.open_search_panel(&q);
+            }
             _ if text.starts_with("/theme ") => {
                 let name = text["/theme ".len()..].trim();
                 if theme::set_by_name(name) {
@@ -929,7 +1090,9 @@ impl App {
                 }
             }
             _ => {
-                let text = self.expand_slash(text);
+                let Some(text) = self.expand_slash(text) else {
+                    return;
+                };
                 let p = self.cur_project;
                 let si = match self.cur_session {
                     Some(si) => si,
@@ -1005,10 +1168,19 @@ impl App {
             self.palette_key(k);
             return;
         }
+        if self.textbox.is_some() {
+            self.textbox_key(k);
+            return;
+        }
+        if self.pending_question().is_some() {
+            self.question_key(k);
+            return;
+        }
         if self.pending_modal().is_some() {
             match k.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => self.answer(true),
-                KeyCode::Char('n') | KeyCode::Char('N') => self.answer(false),
+                KeyCode::Char('y') | KeyCode::Char('Y') => self.answer("allowed-once"),
+                KeyCode::Char('a') | KeyCode::Char('A') => self.answer("allowed-session"),
+                KeyCode::Char('n') | KeyCode::Char('N') => self.answer("rejected"),
                 KeyCode::Esc => self.modal_hidden = true,
                 _ => {}
             }
@@ -1454,23 +1626,66 @@ impl App {
 
     /// `/skill args` becomes a prompt that points the model at the skill;
     /// `/command args` expands the command file. Anything else passes through.
-    fn expand_slash(&mut self, text: String) -> String {
+    fn expand_slash(&mut self, text: String) -> Option<String> {
         let Some(rest) = text.strip_prefix('/') else {
-            return text;
+            return Some(text);
         };
         let (name, args) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+        if let Some(spec) = name.strip_prefix("mcp:") {
+            return self.run_mcp_prompt(spec, args);
+        }
         let pr = &self.projects[self.cur_project];
         if let Some(c) = pr.commands.iter().find(|c| c.name == name) {
-            return destro_core::skills::expand_command(c, args.trim());
+            return Some(destro_core::skills::expand_command(c, args.trim()));
         }
         if let Some(k) = pr.skills.iter().find(|k| k.name == name) {
             let mut s = format!("Use the `{}` skill (load it with the skill tool).", k.name);
             if !args.trim().is_empty() {
                 s.push_str(&format!(" Task: {}", args.trim()));
             }
-            return s;
+            return Some(s);
         }
-        text
+        Some(text)
+    }
+
+    /// `/mcp:<server>:<prompt> key=value …` (or positional values) → prompt text.
+    fn run_mcp_prompt(&mut self, spec: &str, args: &str) -> Option<String> {
+        let Some((server, name)) = spec.split_once(':') else {
+            self.flash("usage: /mcp:<server>:<prompt> [args]".into());
+            return None;
+        };
+        let wanted: Vec<String> = self
+            .backend
+            .mcp_prompts(self.cur_project)
+            .into_iter()
+            .find(|p| p.server == server && p.name == name)
+            .map(|p| p.arguments.into_iter().map(|a| a.name).collect())
+            .unwrap_or_default();
+        let mut map = serde_json::Map::new();
+        let mut positional = wanted.iter();
+        for tok in args.split_whitespace() {
+            match tok.split_once('=') {
+                Some((k, v)) => {
+                    map.insert(k.to_string(), json!(v));
+                }
+                None => {
+                    if let Some(k) = positional.next() {
+                        map.insert(k.clone(), json!(tok));
+                    }
+                }
+            }
+        }
+        match self.backend.mcp_prompt(self.cur_project, server, name, map) {
+            Ok(t) if !t.trim().is_empty() => Some(t),
+            Ok(_) => {
+                self.flash("that prompt came back empty".into());
+                None
+            }
+            Err(e) => {
+                self.flash(format!("prompt failed: {e}"));
+                None
+            }
+        }
     }
 
     // ----- history and editing ----------------------------------------------------------
@@ -1737,7 +1952,7 @@ impl App {
             })
             .collect();
         let mut p = Panel::new(Kind::Resume, "RESUME A SESSION", items);
-        p.footer = "Enter continue it · type to filter · /import brings in dsh chats".into();
+        p.footer = "Enter continue · Ctrl+R rename · Ctrl+F fork · Ctrl+D delete · /search finds text in all sessions".into();
         p.empty = "no saved sessions for this workspace yet".into();
         self.panel = Some(p);
     }
@@ -1836,8 +2051,9 @@ impl App {
         let tx = self.tx.clone();
         let work = move || {
             let (mut new, mut skipped, mut failed) = (0, 0, 0);
-            for s in &chosen {
-                match destro_core::dsh::import_session(s, &cwd, false) {
+            let jobs: Vec<_> = chosen.iter().cloned().map(|s| (s, cwd.clone())).collect();
+            for r in destro_core::dsh::import_many(&jobs, false) {
+                match r {
                     Ok(destro_core::dsh::Imported::New) => new += 1,
                     Ok(destro_core::dsh::Imported::AlreadyThere) => skipped += 1,
                     Err(_) => failed += 1,
@@ -1886,6 +2102,26 @@ impl App {
             KeyCode::End => p.sel = p.visible().len().saturating_sub(1),
             KeyCode::Char('a') if ctrl && p.multi => p.mark_all(),
             KeyCode::Char(' ') if p.multi => p.toggle_mark(),
+            KeyCode::Char('d') if ctrl && kind == Kind::Resume => {
+                let id = p.current().map(|i| i.id.clone());
+                if let Some(id) = id {
+                    self.delete_session(&id);
+                }
+            }
+            KeyCode::Char('r') if ctrl && kind == Kind::Resume => {
+                let id = p.current().map(|i| i.id.clone());
+                self.panel = None;
+                if let Some(id) = id {
+                    self.rename_stored(&id);
+                }
+            }
+            KeyCode::Char('f') if ctrl && kind == Kind::Resume => {
+                let id = p.current().map(|i| i.id.clone());
+                self.panel = None;
+                if let Some(id) = id {
+                    self.fork_stored(&id);
+                }
+            }
             KeyCode::Char('r') if kind == Kind::Mcp => {
                 if let Some(id) = p.current().map(|i| i.id.clone()) {
                     self.backend.mcp_do(self.cur_project, &id, "reconnect");
@@ -1949,6 +2185,18 @@ impl App {
                 self.backend.mcp_do(self.cur_project, &name, action);
             }
             Kind::Context => {}
+            Kind::Provider => {
+                self.panel = None;
+                if let Some(id) = cur {
+                    self.choose_provider(&id);
+                }
+            }
+            Kind::Search => {
+                self.panel = None;
+                if let Some(path) = cur {
+                    self.open_hit(&path);
+                }
+            }
             Kind::Resume => {
                 self.panel = None;
                 if let Some(path) = cur {
@@ -1985,6 +2233,19 @@ impl App {
             self.select(Row::Session(p, si, 0));
             return;
         }
+        // advisor sessions come back in advisor mode (that rebuilds the workspace
+        // runtime, so only when nothing is running)
+        if let Some((a, w)) = &meta.advisor
+            && self.advisor.as_ref() != Some(&(a.clone(), w.clone()))
+        {
+            if self.projects[p].running_count() == 0 {
+                self.arm_advisor(a, w);
+            } else {
+                self.flash(
+                    "this was an advisor session; finish running work, then resume it".into(),
+                );
+            }
+        }
         let events = destro_core::store::load(path);
         let si = self.projects[p].session_mut(&meta.id);
         {
@@ -1995,10 +2256,43 @@ impl App {
             s.unread = false;
             s.status = Status::Idle;
         }
+        // saved subagents: unique ids per resume so they never clash with new ones
+        let kids = destro_core::store::children(path);
+        let ids: HashMap<String, String> = kids
+            .iter()
+            .map(|k| (k.id.clone(), format!("{}~{}", meta.id, k.id)))
+            .collect();
+        for k in &kids {
+            let new_id = ids[&k.id].clone();
+            let parent = ids
+                .get(&k.parent)
+                .cloned()
+                .unwrap_or_else(|| meta.id.clone());
+            let ci = self.projects[p].session_mut(&new_id);
+            let s = &mut self.projects[p].sessions[ci];
+            s.parent = Some(parent);
+            for ev in &destro_core::store::load(&k.path) {
+                s.apply_event(ev);
+            }
+            if s.title.is_none() {
+                s.title = Some(k.title.clone());
+            }
+            s.unread = false;
+            s.status = Status::Idle;
+        }
         let history = destro_core::store::replay_messages(&events);
         self.backend.restore(p, &meta.id, history, &meta.model);
         self.cur_session = Some(si);
-        self.flash(format!("resumed: {}", meta.title));
+        let extra = if kids.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " (+{} subagent{})",
+                kids.len(),
+                if kids.len() == 1 { "" } else { "s" }
+            )
+        };
+        self.flash(format!("resumed: {}{extra}", meta.title));
     }
 
     fn export_session(&mut self) {
@@ -2058,6 +2352,336 @@ impl App {
     }
 }
 
+impl App {
+    // ----- approvals, compaction ----------------------------------------------------------
+
+    pub fn toggle_approvals(&mut self) {
+        self.approvals = !self.approvals;
+        self.backend.set_approvals(self.approvals);
+        if self.persist {
+            crate::config::save_approvals(self.approvals);
+        }
+        self.flash(if self.approvals {
+            "approvals on — shell, file writes and MCP tools ask first".into()
+        } else {
+            "approvals off — tools run without asking".into()
+        });
+    }
+
+    fn compact_current(&mut self) {
+        match self.cur_session_id() {
+            Some(sid) => {
+                self.backend.compact(self.cur_project, &sid);
+                self.flash("compacting this session's history…".into());
+            }
+            None => self.flash("no session selected".into()),
+        }
+    }
+
+    // ----- text box ------------------------------------------------------------------------
+
+    fn textbox_key(&mut self, k: KeyEvent) {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let Some(tb) = self.textbox.as_mut() else {
+            return;
+        };
+        match k.code {
+            KeyCode::Esc => self.textbox = None,
+            KeyCode::Backspace => {
+                tb.value.pop();
+            }
+            KeyCode::Char('u') if ctrl => tb.value.clear(),
+            KeyCode::Char(c) if !ctrl => tb.value.push(c),
+            KeyCode::Enter => {
+                if let Some(tb) = self.textbox.take() {
+                    self.submit_textbox(tb);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Pasted text goes into whichever text box is open.
+    fn submit_textbox(&mut self, tb: TextBox) {
+        let value = tb.value.trim().to_string();
+        if value.is_empty() {
+            return;
+        }
+        match tb.purpose {
+            TextPurpose::ApiKey {
+                provider,
+                env,
+                model,
+            } => {
+                if let Err(e) = destro_core::save_key(&env, &value) {
+                    self.flash(format!("could not save the key: {e}"));
+                    return;
+                }
+                match self.backend.add_provider(&provider) {
+                    Ok(()) => {
+                        self.refresh_suggestions();
+                        self.apply_model(&format!("{provider}/{model}"));
+                    }
+                    Err(e) => self.flash(format!("provider {provider}: {e}")),
+                }
+            }
+            TextPurpose::Rename { path, sid } => {
+                if let Err(e) = destro_core::store::rename(std::path::Path::new(&path), &value) {
+                    self.flash(format!("rename failed: {e}"));
+                    return;
+                }
+                let p = self.cur_project;
+                if let Some(&si) = self.projects[p].index.get(&sid) {
+                    self.projects[p].sessions[si].title = Some(value.clone());
+                }
+                self.flash(format!("renamed to: {value}"));
+            }
+        }
+    }
+
+    // ----- providers -----------------------------------------------------------------------
+
+    /// Re-read which providers are usable and refresh the model list.
+    fn refresh_suggestions(&mut self) {
+        if !self.strict_paths {
+            return;
+        }
+        let mut v = vec![];
+        for info in destro_core::ProviderRegistry::load().list() {
+            if !info.configured || info.id == "mock" {
+                continue;
+            }
+            if info.models.is_empty() {
+                v.push(format!("{}/{}", info.id, info.default_model));
+            }
+            for m in &info.models {
+                v.push(format!("{}/{}", info.id, m));
+            }
+        }
+        if !v.is_empty() {
+            self.model_suggestions = v;
+        }
+    }
+
+    fn open_provider_panel(&mut self) {
+        if !self.strict_paths {
+            self.flash("providers are not available in the demo".into());
+            return;
+        }
+        let current = self.projects[self.cur_project].model.clone();
+        let items = destro_core::ProviderRegistry::load()
+            .list()
+            .into_iter()
+            .map(|i| {
+                let it = panel::Item::new(i.id.clone(), format!("{} ({})", i.id, i.label)).detail(
+                    format!(
+                        "default {} · {} model{}",
+                        i.default_model,
+                        i.models.len().max(1),
+                        if i.models.len() == 1 { "" } else { "s" }
+                    ),
+                );
+                if current.starts_with(&format!("{}/", i.id)) {
+                    it.tag("in use", Tone::Good)
+                } else if i.configured {
+                    it.tag("ready", Tone::Good)
+                } else {
+                    it.tag(
+                        format!("needs {}", i.api_key_env.as_deref().unwrap_or("a key")),
+                        Tone::Warn,
+                    )
+                }
+            })
+            .collect();
+        let mut p = Panel::new(Kind::Provider, "PROVIDERS", items);
+        p.footer =
+            "Enter use it (asks for the API key if missing) · keys are saved in your user config"
+                .into();
+        self.panel = Some(p);
+    }
+
+    fn choose_provider(&mut self, id: &str) {
+        let reg = destro_core::ProviderRegistry::load();
+        let Some(info) = reg.list().into_iter().find(|i| i.id == id) else {
+            return;
+        };
+        if info.configured {
+            match self.backend.add_provider(id) {
+                Ok(()) => {
+                    self.refresh_suggestions();
+                    self.apply_model(&format!("{id}/{}", info.default_model));
+                }
+                Err(e) => self.flash(format!("provider {id}: {e}")),
+            }
+        } else if let Some(env) = info.api_key_env {
+            self.textbox = Some(TextBox {
+                title: format!("API KEY · {id}"),
+                hint: format!("stored as {env} in your Destro config; Enter saves, Esc cancels"),
+                value: String::new(),
+                secret: true,
+                purpose: TextPurpose::ApiKey {
+                    provider: id.to_string(),
+                    env,
+                    model: info.default_model,
+                },
+            });
+        }
+    }
+
+    // ----- session management -------------------------------------------------------------
+
+    fn rename_prompt(&mut self) {
+        let Some(sid) = self.cur_session_id() else {
+            self.flash("no session selected".into());
+            return;
+        };
+        self.rename_stored_by_id(&sid);
+    }
+
+    fn rename_stored_by_id(&mut self, sid: &str) {
+        let cwd = self.projects[self.cur_project].cwd.clone();
+        let Some(path) = destro_core::store::session_path(&cwd, sid).filter(|p| p.exists()) else {
+            self.flash("this session is not saved yet".into());
+            return;
+        };
+        let current = destro_core::store::read_meta(&path)
+            .map(|m| m.title)
+            .unwrap_or_default();
+        self.textbox = Some(TextBox {
+            title: "RENAME SESSION".into(),
+            hint: "Enter saves · Esc cancels".into(),
+            value: current,
+            secret: false,
+            purpose: TextPurpose::Rename {
+                path: path.to_string_lossy().to_string(),
+                sid: sid.to_string(),
+            },
+        });
+    }
+
+    fn rename_stored(&mut self, path: &str) {
+        let meta = destro_core::store::read_meta(std::path::Path::new(path));
+        self.textbox = Some(TextBox {
+            title: "RENAME SESSION".into(),
+            hint: "Enter saves · Esc cancels".into(),
+            value: meta.as_ref().map(|m| m.title.clone()).unwrap_or_default(),
+            secret: false,
+            purpose: TextPurpose::Rename {
+                path: path.to_string(),
+                sid: meta.map(|m| m.id).unwrap_or_default(),
+            },
+        });
+    }
+
+    fn rename_current(&mut self, title: &str) {
+        let Some(sid) = self.cur_session_id() else {
+            self.flash("no session selected".into());
+            return;
+        };
+        let cwd = self.projects[self.cur_project].cwd.clone();
+        let p = self.cur_project;
+        if let Some(path) = destro_core::store::session_path(&cwd, &sid).filter(|x| x.exists()) {
+            let _ = destro_core::store::rename(&path, title);
+        }
+        if let Some(&si) = self.projects[p].index.get(&sid) {
+            self.projects[p].sessions[si].title = Some(title.to_string());
+        }
+        self.flash(format!("renamed to: {title}"));
+    }
+
+    fn fork_current(&mut self) {
+        let Some(sid) = self.cur_session_id() else {
+            self.flash("no session selected".into());
+            return;
+        };
+        let cwd = self.projects[self.cur_project].cwd.clone();
+        match destro_core::store::session_path(&cwd, &sid).filter(|p| p.exists()) {
+            Some(path) => self.fork_stored(&path.to_string_lossy()),
+            None => self.flash("this session is not saved yet; send a message first".into()),
+        }
+    }
+
+    fn fork_stored(&mut self, path: &str) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        match destro_core::store::fork(std::path::Path::new(path), &format!("fork-{nanos:x}")) {
+            Ok(copy) => self.resume_session(&copy.to_string_lossy()),
+            Err(e) => self.flash(format!("fork failed: {e}")),
+        }
+    }
+
+    fn delete_session(&mut self, path: &str) {
+        let Some(meta) = destro_core::store::read_meta(std::path::Path::new(path)) else {
+            return;
+        };
+        if self.projects[self.cur_project].index.contains_key(&meta.id) {
+            self.flash("that session is open; delete it from a later run".into());
+            return;
+        }
+        if self.confirm_delete.as_deref() != Some(path) {
+            self.confirm_delete = Some(path.to_string());
+            self.flash(format!("Ctrl+D again to delete “{}” for good", meta.title));
+            return;
+        }
+        self.confirm_delete = None;
+        match destro_core::store::delete(std::path::Path::new(path)) {
+            Ok(()) => {
+                self.flash("deleted".into());
+                self.open_resume_panel();
+            }
+            Err(e) => self.flash(format!("delete failed: {e}")),
+        }
+    }
+
+    fn open_search_panel(&mut self, query: &str) {
+        let hits = destro_core::store::search(query, 60);
+        let items = hits
+            .into_iter()
+            .map(|h| {
+                let ws = std::path::Path::new(&h.meta.cwd)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                panel::Item::new(h.meta.path.to_string_lossy(), h.meta.title)
+                    .detail(h.snippet)
+                    .tag(ws, Tone::Muted)
+            })
+            .collect();
+        let mut p = Panel::new(Kind::Search, &format!("SEARCH · {query}"), items);
+        p.footer = "Enter open it (the workspace opens if needed) · type to narrow".into();
+        p.empty = "no saved session mentions that".into();
+        self.panel = Some(p);
+    }
+
+    /// Open a search hit, switching to (or opening) its workspace first.
+    fn open_hit(&mut self, path: &str) {
+        let Some(meta) = destro_core::store::read_meta(std::path::Path::new(path)) else {
+            self.flash("could not read that session".into());
+            return;
+        };
+        match self
+            .projects
+            .iter()
+            .position(|p| !p.closed && p.cwd == meta.cwd)
+        {
+            Some(i) => self.select(Row::Project(i)),
+            None => {
+                if !std::path::Path::new(&meta.cwd).is_dir() {
+                    self.flash(format!("{} no longer exists", meta.cwd));
+                    return;
+                }
+                if let Err(e) = self.open_workspace(&meta.cwd) {
+                    self.flash(format!("open failed: {e}"));
+                    return;
+                }
+            }
+        }
+        self.resume_session(path);
+    }
+}
+
 fn base64(data: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
@@ -2093,10 +2717,41 @@ mod flow_tests {
     struct Rec {
         restored: Arc<Mutex<Restored>>,
         models: Arc<Mutex<Models>>,
+        sent: Arc<Mutex<Vec<Value>>>,
+        approvals: Arc<Mutex<Vec<bool>>>,
     }
 
     impl Backend for Rec {
-        fn send(&self, _: usize, _: Value) {}
+        fn send(&self, _: usize, frame: Value) {
+            self.sent.lock().unwrap().push(frame);
+        }
+        fn set_approvals(&self, on: bool) {
+            self.approvals.lock().unwrap().push(on);
+        }
+        fn mcp_prompts(&self, _: usize) -> Vec<destro_core::mcp::McpPrompt> {
+            vec![destro_core::mcp::McpPrompt {
+                server: "srv".into(),
+                name: "review".into(),
+                description: "Review a file".into(),
+                arguments: vec![destro_core::mcp::McpPromptArg {
+                    name: "file".into(),
+                    description: String::new(),
+                    required: true,
+                }],
+            }]
+        }
+        fn mcp_prompt(
+            &self,
+            _: usize,
+            server: &str,
+            name: &str,
+            args: serde_json::Map<String, Value>,
+        ) -> Result<String, String> {
+            Ok(format!(
+                "{server}/{name}: review {}",
+                args["file"].as_str().unwrap_or("?")
+            ))
+        }
         fn kill(&self, _: usize) {}
         fn open(&self, _: usize, _: &ProjectSpec) {}
         fn restore(&self, _: usize, session: &str, history: Vec<Value>, model: &str) {
@@ -2187,6 +2842,180 @@ mod flow_tests {
         assert_eq!(a.projects[0].model, "zz/custom");
     }
 
+    fn ask(a: &mut App, id: &str, params: Value) {
+        a.on_frame(
+            0,
+            &json!({"jsonrpc":"2.0","id":id,"method":"user-question/ask","params":params})
+                .to_string(),
+        );
+    }
+
+    #[test]
+    fn ask_user_modal_answers_with_an_option_or_typed_text_or_skips() {
+        let rec = Rec::default();
+        let mut a = app(&rec);
+        ask(
+            &mut a,
+            "q1",
+            json!({"sessionId":"s","question":"colour?","options":["red","blue"]}),
+        );
+        assert_eq!(a.pending_question().unwrap().question, "colour?");
+        a.on_key(key(KeyCode::Down));
+        a.on_key(key(KeyCode::Enter));
+        let sent = rec.sent.lock().unwrap().clone();
+        assert_eq!(sent[0]["id"], "q1");
+        assert_eq!(sent[0]["result"]["answer"], "blue");
+        assert!(a.pending_question().is_none());
+
+        ask(&mut a, "q2", json!({"sessionId":"s","question":"name?"}));
+        for c in "bob".chars() {
+            a.on_key(key(KeyCode::Char(c)));
+        }
+        a.on_key(key(KeyCode::Enter));
+        assert_eq!(rec.sent.lock().unwrap()[1]["result"]["answer"], "bob");
+
+        ask(
+            &mut a,
+            "q3",
+            json!({"sessionId":"s","question":"skip me","options":["x"]}),
+        );
+        a.on_key(key(KeyCode::Esc));
+        assert_eq!(rec.sent.lock().unwrap()[2]["result"]["cancelled"], true);
+    }
+
+    #[test]
+    fn approval_keys_map_to_outcomes() {
+        let rec = Rec::default();
+        let mut a = app(&rec);
+        for (k, want) in [
+            ('y', "allowed-once"),
+            ('a', "allowed-session"),
+            ('n', "rejected"),
+        ] {
+            a.on_frame(
+                0,
+                &json!({"jsonrpc":"2.0","id":format!("a-{k}"),"method":"approval/request",
+                    "params":{"sessionId":"s","toolName":"pwsh","reason":"ls"}})
+                .to_string(),
+            );
+            a.on_key(key(KeyCode::Char(k)));
+            assert_eq!(
+                rec.sent.lock().unwrap().last().unwrap()["result"]["outcome"],
+                want
+            );
+        }
+    }
+
+    #[test]
+    fn approvals_toggle_reaches_the_backend() {
+        let rec = Rec::default();
+        let mut a = app(&rec);
+        a.input = "/approvals".into();
+        a.submit();
+        a.input = "/approvals".into();
+        a.submit();
+        assert_eq!(*rec.approvals.lock().unwrap(), vec![true, false]);
+        assert!(!a.approvals);
+    }
+
+    #[test]
+    fn mcp_prompt_commands_expand_with_positional_and_named_args() {
+        let rec = Rec::default();
+        let mut a = app(&rec);
+        a.input = "/mcp".into();
+        assert!(
+            a.slash_matches()
+                .iter()
+                .any(|e| e.name == "/mcp:srv:review")
+        );
+        assert_eq!(
+            a.expand_slash("/mcp:srv:review src/a.rs".into()).unwrap(),
+            "srv/review: review src/a.rs"
+        );
+        assert_eq!(
+            a.expand_slash("/mcp:srv:review file=b.rs".into()).unwrap(),
+            "srv/review: review b.rs"
+        );
+    }
+
+    #[test]
+    fn rename_through_the_text_box_updates_file_and_transcript() {
+        let dir = std::env::temp_dir().join(format!("destro-rn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.jsonl");
+        destro_core::store::SessionWriter::open_at(&path, "/tmp/p", "s1", "m", "destro").unwrap();
+        let rec = Rec::default();
+        let mut a = app(&rec);
+        a.projects[0].session_mut("s1");
+        a.textbox = Some(TextBox {
+            title: "RENAME".into(),
+            hint: String::new(),
+            value: String::new(),
+            secret: false,
+            purpose: TextPurpose::Rename {
+                path: path.to_string_lossy().to_string(),
+                sid: "s1".into(),
+            },
+        });
+        for c in "new name".chars() {
+            a.on_key(key(KeyCode::Char(c)));
+        }
+        a.on_key(key(KeyCode::Enter));
+        assert!(a.textbox.is_none());
+        assert_eq!(
+            destro_core::store::read_meta(&path).unwrap().title,
+            "new name"
+        );
+        assert_eq!(a.projects[0].sessions[0].title.as_deref(), Some("new name"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_restores_subagents_under_their_parents_and_advisor_mode() {
+        let dir = std::env::temp_dir().join(format!("destro-kids-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.join("r1.jsonl");
+        let mut w = destro_core::store::SessionWriter::open_at_with(
+            &root,
+            "/tmp/p",
+            "r1",
+            "big",
+            "destro",
+            json!({"advisor": {"advisor": "big", "slave": "small"}}),
+        )
+        .unwrap();
+        w.append(&json!({"type":"user/message","data":{"content":[{"type":"text","text":"plan it"}],"source":{"kind":"user"}}}));
+        for (id, parent, title) in [
+            ("session-000001", "r1", "worker A"),
+            ("session-000002", "session-000001", "nested"),
+        ] {
+            let cp = destro_core::store::child_path(&dir, "r1", id);
+            let mut cw = destro_core::store::SessionWriter::open_at_with(
+                &cp,
+                "/tmp/p",
+                id,
+                "small",
+                "destro",
+                json!({"parent": parent, "root": "r1"}),
+            )
+            .unwrap();
+            cw.append(&json!({"type":"session/title","data":{"title":title}}));
+        }
+        let rec = Rec::default();
+        let mut a = app(&rec);
+        a.resume_session(&root.to_string_lossy());
+        let pr = &a.projects[0];
+        let a1 = pr.index["r1~session-000001"];
+        let a2 = pr.index["r1~session-000002"];
+        assert_eq!(pr.sessions[a1].parent.as_deref(), Some("r1"));
+        assert_eq!(pr.sessions[a2].parent.as_deref(), Some("r1~session-000001"));
+        assert_eq!(pr.sessions[a2].title.as_deref(), Some("nested"));
+        assert_eq!(a.advisor, Some(("big".to_string(), "small".to_string())));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn slash_popup_lists_skills_and_history_recalls() {
         let rec = Rec::default();
@@ -2204,7 +3033,10 @@ mod flow_tests {
         let m = a.slash_matches();
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].name, "/deploy");
-        assert_eq!(a.expand_slash("/deploy prod".into()), "Deploy prod");
+        assert_eq!(
+            a.expand_slash("/deploy prod".into()).unwrap(),
+            "Deploy prod"
+        );
         a.history = vec!["first".into(), "second".into()];
         a.input.clear();
         a.on_key(key(KeyCode::Up));

@@ -16,6 +16,39 @@ use serde::{Deserialize, Serialize};
 
 use super::{MockProvider, OpenAiCompatProvider, Provider};
 
+fn keys_file() -> Option<PathBuf> {
+    crate::context::data_dir().map(|d| d.join("keys.json"))
+}
+
+/// An API key: the environment variable wins, then `keys.json` in the data
+/// directory (written by [`save_key`], so a key can be entered in the TUI).
+pub fn key_of(var: &str) -> Option<String> {
+    if let Some(v) = env::var_os(var).filter(|v| !v.is_empty()) {
+        return v.into_string().ok();
+    }
+    let text = fs::read_to_string(keys_file()?).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    v[var]
+        .as_str()
+        .filter(|k| !k.is_empty())
+        .map(str::to_string)
+}
+
+/// Remember a key for `var` in `keys.json` (plain text, user-only data dir).
+pub fn save_key(var: &str, key: &str) -> Result<(), String> {
+    let path = keys_file().ok_or("no data directory")?;
+    let mut v: serde_json::Value = fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    v[var] = serde_json::Value::String(key.trim().to_string());
+    if let Some(d) = path.parent() {
+        fs::create_dir_all(d).map_err(|e| e.to_string())?;
+    }
+    fs::write(&path, serde_json::to_string_pretty(&v).unwrap_or_default())
+        .map_err(|e| e.to_string())
+}
+
 /// Which transport backs a descriptor.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -77,6 +110,9 @@ pub struct ProviderInfo {
     pub requires_key: bool,
     /// Whether that variable is currently set (or no key is needed).
     pub configured: bool,
+    /// The environment variable that carries the key, if any.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
 }
 
 /// The set of selectable providers.
@@ -231,7 +267,8 @@ impl ProviderRegistry {
                 configured: descriptor
                     .api_key_env
                     .as_ref()
-                    .is_none_or(|var| env::var_os(var).is_some()),
+                    .is_none_or(|var| key_of(var).is_some()),
+                api_key_env: descriptor.api_key_env.clone(),
             })
             .collect()
     }
@@ -260,7 +297,7 @@ impl ProviderRegistry {
                 }
                 let api_key = match &descriptor.api_key_env {
                     None => String::new(),
-                    Some(var) => env::var(var).map_err(|_| {
+                    Some(var) => key_of(var).ok_or_else(|| {
                         format!("provider `{id}` requires environment variable {var}")
                     })?,
                 };
@@ -283,7 +320,7 @@ impl ProviderRegistry {
                     && descriptor
                         .api_key_env
                         .as_ref()
-                        .is_none_or(|var| env::var_os(var).is_some())
+                        .is_none_or(|var| key_of(var).is_some())
             })
             .map(|descriptor| descriptor.id.clone())
             .unwrap_or_else(|| "mock".to_string())

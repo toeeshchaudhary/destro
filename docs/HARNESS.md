@@ -21,7 +21,8 @@ next phases must add to reach feature parity with dsh.
 | Context accounting | usage only |
 | Instruction files (`AGENTS.md`/`CLAUDE.md`), skills, custom commands, MCP client | working — see [CONVENTIONS.md](CONVENTIONS.md) |
 | Session persistence, `/resume`, dsh chat import, model switching | working |
-| Compaction, sandbox, approvals | not yet — phase 3 |
+| Approvals toggle, `ask_user`, compaction, web search/fetch, todo list | working |
+| Sandbox | not yet — phase 3 |
 
 Provider vendors are configuration, not code: see
 [PROVIDERS.md](PROVIDERS.md). Advisor mode is described in

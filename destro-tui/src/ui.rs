@@ -318,6 +318,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.panel.is_some() {
         draw_panel(f, app, area);
     }
+    if app.textbox.is_some() {
+        draw_textbox(f, app, area);
+    }
+    if app.pending_question().is_some() {
+        draw_question(f, app, area);
+    }
     if app.themes.is_some() {
         draw_theme_picker(f, app, area);
     }
@@ -585,7 +591,10 @@ fn draw_main(f: &mut Frame, app: &mut App, area: Rect) {
         || app.snip.is_some()
         || app.setup.is_some()
         || app.palette.is_some()
-        || app.themes.is_some();
+        || app.themes.is_some()
+        || app.panel.is_some()
+        || app.textbox.is_some()
+        || app.pending_question().is_some();
     let running = cs
         .map(|si| app.projects[cp].sessions[si].status == Status::Running)
         .unwrap_or(false);
@@ -649,6 +658,8 @@ fn draw_main(f: &mut Frame, app: &mut App, area: Rect) {
     } else if app.pending_modal().is_some() {
         foot.extend(hint("y", "allow once"));
         foot.push(Span::raw("   "));
+        foot.extend(hint("a", "always"));
+        foot.push(Span::raw("   "));
         foot.extend(hint("n", "reject"));
         foot.push(Span::raw("   "));
         foot.extend(hint("Esc", "decide later"));
@@ -676,7 +687,15 @@ fn draw_main(f: &mut Frame, app: &mut App, area: Rect) {
             foot.push(Span::raw("   "));
         }
     }
-    let tag = format!("◐ {} ", theme::cur().name);
+    let tag = format!(
+        "{}◐ {} ",
+        if app.approvals {
+            "approvals on · "
+        } else {
+            ""
+        },
+        theme::cur().name
+    );
     let tagw = tag.width() as u16;
     if area.width > tagw + 30 {
         let r = Rect {
@@ -1145,17 +1164,19 @@ fn draw_approval(f: &mut Frame, app: &App, (p, a): (usize, usize), area: Rect) {
     l.push(Line::raw(""));
     l.push(Line::from(vec![
         Span::styled(" y  Allow once ", theme::chip(theme::cur().ok)),
-        Span::raw("   "),
+        Span::raw("  "),
+        Span::styled(" a  Always (this run) ", theme::chip(theme::cur().accent2)),
+        Span::raw("  "),
         Span::styled(" n  Reject ", theme::chip(theme::cur().err)),
-        Span::raw("   "),
-        Span::styled("Esc  decide later", theme::muted()),
+        Span::raw("  "),
+        Span::styled("Esc  later", theme::muted()),
     ]));
     f.render_widget(Paragraph::new(l), inner);
 }
 
 fn draw_help(f: &mut Frame, area: Rect) {
     let wide = area.width >= 104;
-    let (w, h) = if wide { (100, 26) } else { (66, 48) };
+    let (w, h) = if wide { (100, 30) } else { (66, 54) };
     let inner = modal(
         f,
         area,
@@ -1197,7 +1218,12 @@ fn draw_help(f: &mut Frame, area: Rect) {
         sec("WORKSPACE", half),
         key("Ctrl+P", "command palette — search everything"),
         key("Ctrl+T", "colour themes with live preview"),
-        key("Alt+M  /model", "switch model / provider"),
+        key("Alt+M  /model", "switch model"),
+        key("/provider", "pick a provider, enter its API key"),
+        key("/approvals", "ask before shell / writes / MCP tools"),
+        key("/compact", "summarise old messages to free context"),
+        key("/search  /fork", "search all sessions · fork this one"),
+        key("/rename", "rename this session"),
         key("/skills  /mcp", "skills, commands, MCP servers"),
         key("/context", "AGENTS.md / CLAUDE.md in use"),
         key("/import", "bring in DeepSeek Harness chats"),
@@ -1653,5 +1679,116 @@ fn draw_panel(f: &mut Frame, app: &App, area: Rect) {
         Span::raw(" "),
         Span::styled(truncate(&p.footer, iw.saturating_sub(2)), theme::muted()),
     ]));
+    f.render_widget(Paragraph::new(l), inner);
+}
+
+/// A one-line input popup (API key, rename).
+fn draw_textbox(f: &mut Frame, app: &App, area: Rect) {
+    let Some(tb) = &app.textbox else { return };
+    let inner = modal(
+        f,
+        area,
+        72.min(area.width.saturating_sub(4)).max(30),
+        8,
+        chip_title(&tb.title, theme::cur().accent),
+        theme::accent(),
+    );
+    let shown: String = if tb.secret {
+        "•".repeat(tb.value.chars().count())
+    } else {
+        tb.value.clone()
+    };
+    let w = inner.width.saturating_sub(6) as usize;
+    let tail: String = {
+        let n = shown.chars().count();
+        shown.chars().skip(n.saturating_sub(w)).collect()
+    };
+    let l = vec![
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled(" › ", theme::accent_b()),
+            Span::styled(tail, theme::bold()),
+            Span::styled("▏", theme::accent_b()),
+        ]),
+        Line::raw(""),
+        Line::styled(
+            format!(" {}", truncate(&tb.hint, inner.width as usize - 2)),
+            theme::muted(),
+        ),
+    ];
+    f.render_widget(Paragraph::new(l), inner);
+}
+
+/// The agent's `ask_user` question: pick an option or type an answer.
+fn draw_question(f: &mut Frame, app: &App, area: Rect) {
+    let Some(q) = app.pending_question() else {
+        return;
+    };
+    let who = app.projects[app.cur_project]
+        .index
+        .get(&q.session_id)
+        .map(|&i| app.projects[app.cur_project].sessions[i].label())
+        .unwrap_or_default();
+    let width = 76.min(area.width.saturating_sub(4)).max(30);
+    let text_w = width.saturating_sub(6) as usize;
+    let wrapped = wrap(&q.question, text_w);
+    let h = (wrapped.len().min(8) + q.options.len().min(8) + 8) as u16;
+    let inner = modal(
+        f,
+        area,
+        width,
+        h,
+        chip_title("? QUESTION", theme::cur().accent2),
+        theme::accent2(),
+    );
+    let mut l: Vec<Line> = vec![
+        Line::raw(""),
+        Line::styled(format!(" from {}", truncate(&who, text_w)), theme::muted()),
+        Line::raw(""),
+    ];
+    for line in wrapped.into_iter().take(8) {
+        l.push(Line::styled(format!(" {line}"), theme::bold()));
+    }
+    l.push(Line::raw(""));
+    for (i, o) in q.options.iter().enumerate().take(8) {
+        let on = app.q_input.is_empty() && i == app.q_sel;
+        l.push(
+            Line::from(vec![
+                Span::styled(if on { " ▸ " } else { "   " }, theme::accent_b()),
+                Span::styled(
+                    truncate(o, text_w),
+                    if on { theme::bold() } else { theme::text() },
+                ),
+            ])
+            .style(if on { theme::sel() } else { Style::default() }),
+        );
+    }
+    let typing = !app.q_input.is_empty();
+    l.push(Line::from(vec![
+        Span::styled(" ✎ ", theme::accent_b()),
+        Span::styled(
+            if typing {
+                app.q_input.clone()
+            } else {
+                "or type your own answer…".to_string()
+            },
+            if typing {
+                theme::bold()
+            } else {
+                theme::muted()
+            },
+        ),
+        Span::styled(if typing { "▏" } else { "" }, theme::accent_b()),
+    ]));
+    l.push(Line::raw(""));
+    let mut hl = vec![Span::raw(" ")];
+    if !q.options.is_empty() {
+        hl.extend(hint("↑↓", "choose"));
+        hl.push(Span::raw("   "));
+    }
+    hl.extend(hint("Enter", "answer"));
+    hl.push(Span::raw("   "));
+    hl.extend(hint("Esc", "skip"));
+    l.push(Line::from(hl));
     f.render_widget(Paragraph::new(l), inner);
 }

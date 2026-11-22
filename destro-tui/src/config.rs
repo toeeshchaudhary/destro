@@ -80,3 +80,23 @@ pub fn save_history(h: &[String]) {
         let _ = std::fs::write(p, t);
     }
 }
+
+/// Whether tool approvals were left on last time.
+pub fn load_approvals() -> bool {
+    read_settings()["approvals"].as_bool().unwrap_or(false)
+}
+
+pub fn save_approvals(on: bool) {
+    let Some(p) = settings_file() else { return };
+    let mut v = read_settings();
+    if !v.is_object() {
+        v = serde_json::json!({});
+    }
+    v["approvals"] = serde_json::Value::Bool(on);
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(text) = serde_json::to_string_pretty(&v) {
+        let _ = std::fs::write(p, text);
+    }
+}

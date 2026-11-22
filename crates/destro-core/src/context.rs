@@ -241,6 +241,68 @@ fn expand_imports(
     out
 }
 
+// ----- nested instructions ----------------------------------------------------------------
+
+/// Instruction files in directories *below* the workspace that lie on the way to
+/// `target`, not yet in `seen`. The workspace's own chain is already in the
+/// system prompt; these are the sub-folder `AGENTS.md` files that apply once the
+/// agent starts working in that part of the tree.
+pub fn nested_instructions(
+    cwd: &Path,
+    target: &Path,
+    seen: &mut HashSet<PathBuf>,
+) -> Vec<(PathBuf, String)> {
+    let target = if target.is_relative() {
+        cwd.join(target)
+    } else {
+        target.to_path_buf()
+    };
+    let dir = if target.is_dir() {
+        target
+    } else {
+        match target.parent() {
+            Some(p) => p.to_path_buf(),
+            None => return vec![],
+        }
+    };
+    let rel = match dir.strip_prefix(cwd) {
+        Ok(r) => r.to_path_buf(),
+        Err(_) => match (std::fs::canonicalize(&dir), std::fs::canonicalize(cwd)) {
+            (Ok(d), Ok(c)) => match d.strip_prefix(&c) {
+                Ok(r) => r.to_path_buf(),
+                Err(_) => return vec![],
+            },
+            _ => return vec![],
+        },
+    };
+    let mut out = vec![];
+    let mut d = cwd.to_path_buf();
+    for comp in rel.components() {
+        d.push(comp);
+        for name in ["AGENTS.md", "CLAUDE.md", "CLAUDE.local.md"] {
+            let f = d.join(name);
+            if !f.is_file() || !seen.insert(f.clone()) {
+                continue;
+            }
+            if let Ok(mut text) = std::fs::read_to_string(&f) {
+                if text.trim().is_empty() {
+                    continue;
+                }
+                if text.len() > 16 * 1024 {
+                    let mut cut = 16 * 1024;
+                    while !text.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    text.truncate(cut);
+                    text.push_str("\n… [truncated]");
+                }
+                out.push((f, text));
+            }
+        }
+    }
+    out
+}
+
 // ----- system prompt assembly -------------------------------------------------------------
 
 /// Today's UTC date as `YYYY-MM-DD` (no calendar dependency).
@@ -355,6 +417,28 @@ mod tests {
         std::fs::write(root.join("b.md"), "b @AGENTS.md").unwrap();
         let files = load_instructions(&root);
         assert!(files.iter().any(|f| f.text.contains("b @AGENTS.md")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn nested_files_load_once_and_only_below_the_workspace() {
+        let root = tmp("nested");
+        let sub = root.join("a").join("b");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(root.join("AGENTS.md"), "top").unwrap();
+        std::fs::write(root.join("a").join("AGENTS.md"), "a rules").unwrap();
+        std::fs::write(sub.join("CLAUDE.md"), "b rules").unwrap();
+        let mut seen = HashSet::new();
+        let got = nested_instructions(&root, &sub.join("file.rs"), &mut seen);
+        let texts: Vec<&str> = got.iter().map(|(_, t)| t.as_str()).collect();
+        assert_eq!(
+            texts,
+            ["a rules", "b rules"],
+            "workspace-level file excluded"
+        );
+        assert!(nested_instructions(&root, &sub.join("other.rs"), &mut seen).is_empty());
+        let outside = std::env::temp_dir().join("elsewhere.txt");
+        assert!(nested_instructions(&root, &outside, &mut seen).is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 

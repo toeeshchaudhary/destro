@@ -57,6 +57,28 @@ pub trait Backend: Send + Sync {
     fn mcp_do(&self, _project: usize, _server: &str, _action: &str) {}
     /// Stop the running turn of one session without killing the runtime.
     fn interrupt(&self, _project: usize, _session: &str) {}
+    /// Ask before running shell, file-writing and MCP tools.
+    fn set_approvals(&self, _on: bool) {}
+    /// Fold older history of a session into a summary now.
+    fn compact(&self, _project: usize, _session: &str) {}
+    /// Make a provider (whose key was just saved) usable in running sessions.
+    fn add_provider(&self, _id: &str) -> Result<(), String> {
+        Err("providers cannot be added in this mode".into())
+    }
+    /// MCP prompts of a workspace's connected servers.
+    fn mcp_prompts(&self, _project: usize) -> Vec<destro_core::mcp::McpPrompt> {
+        vec![]
+    }
+    /// Render one MCP prompt to text.
+    fn mcp_prompt(
+        &self,
+        _project: usize,
+        _server: &str,
+        _name: &str,
+        _args: serde_json::Map<String, Value>,
+    ) -> Result<String, String> {
+        Err("no MCP in this mode".into())
+    }
 }
 
 #[derive(Default)]

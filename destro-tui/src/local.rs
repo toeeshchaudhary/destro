@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::{Value, json};
 
 use destro_core::context;
+use destro_core::interact::Decision;
 use destro_core::mcp::{McpHub, McpStatus};
 use destro_core::skills::{self, SkillTool};
 use destro_core::store::SessionWriter;
@@ -96,6 +97,7 @@ pub struct Local {
     model: String,
     providers: Arc<ProviderSet>,
     persist: bool,
+    approvals: std::sync::atomic::AtomicBool,
 }
 
 impl Local {
@@ -123,6 +125,7 @@ impl Local {
                 provider.clone(),
                 &tx,
                 persist,
+                false,
             )));
         }
         let backend = Local {
@@ -132,6 +135,7 @@ impl Local {
             model: model.to_string(),
             providers: provider,
             persist,
+            approvals: std::sync::atomic::AtomicBool::new(false),
         };
         let projects = specs
             .iter()
@@ -150,6 +154,7 @@ impl Local {
         providers: Arc<ProviderSet>,
         tx: &Sender<Msg>,
         persist: bool,
+        approvals: bool,
     ) -> Slot {
         let root = std::path::PathBuf::from(cwd);
         // Conventions: the AGENTS.md / CLAUDE.md chain and the skill catalogue go
@@ -167,6 +172,12 @@ impl Local {
             .as_ref()
             .map(|s| context::assemble(s, &root, &instr, &found_skills));
         let harness = Harness::new(cfg);
+        harness.interact.attach();
+        harness.interact.set_approvals(approvals);
+        let advisor = setup
+            .slave_model
+            .clone()
+            .map(|slave| (setup.model.clone(), slave));
         if !found_skills.is_empty() {
             harness
                 .tools
@@ -185,19 +196,56 @@ impl Local {
                 match rx.recv().await {
                     Ok(HarnessEvent::Session { agent, event, .. }) => {
                         let session = map.lock().unwrap().session_of(agent);
-                        // Root sessions are durable; subagent ids restart every run.
-                        if persist
-                            && let Some(h) = pump_harness.get(agent)
-                            && h.live.parent.is_none()
-                        {
+                        // Every session is durable. Root sessions are filed by id;
+                        // subagents (whose ids restart each run) are filed under
+                        // their root as `<root>.sub.<child>`.
+                        if persist && let Some(h) = pump_harness.get(agent) {
+                            let key = match h.live.parent {
+                                None => session.clone(),
+                                Some(_) => {
+                                    let mut root = agent;
+                                    while let Some(p) =
+                                        pump_harness.get(root).and_then(|x| x.live.parent)
+                                    {
+                                        root = p;
+                                    }
+                                    format!("{}.sub.{session}", map.lock().unwrap().session_of(root))
+                                }
+                            };
                             let mut w = writers.lock().unwrap();
-                            if !w.contains_key(&session)
-                                && let Ok(nw) =
-                                    SessionWriter::open(&pump_cwd, &session, &h.live.model())
-                            {
-                                w.insert(session.clone(), nw);
+                            if !w.contains_key(&key) {
+                                let opened = match h.live.parent {
+                                    None => SessionWriter::open_with(
+                                        &pump_cwd,
+                                        &session,
+                                        &h.live.model(),
+                                        match &advisor {
+                                            Some((a, s)) => json!({"advisor": {"advisor": a, "slave": s}}),
+                                            None => json!({}),
+                                        },
+                                    ),
+                                    Some(parent) => {
+                                        let m = map.lock().unwrap();
+                                        let mut root = parent;
+                                        while let Some(p) =
+                                            pump_harness.get(root).and_then(|x| x.live.parent)
+                                        {
+                                            root = p;
+                                        }
+                                        SessionWriter::open_child(
+                                            &pump_cwd,
+                                            &m.session_of(root),
+                                            &session,
+                                            &m.session_of(parent),
+                                            &h.live.model(),
+                                        )
+                                    }
+                                };
+                                if let Ok(nw) = opened {
+                                    w.insert(key.clone(), nw);
+                                }
                             }
-                            if let Some(wr) = w.get_mut(&session) {
+                            if let Some(wr) = w.get_mut(&key) {
                                 wr.append(&event);
                             }
                         }
@@ -255,6 +303,38 @@ impl Local {
                         );
                     }
                     Ok(HarnessEvent::Spawned { parent: None, .. }) => {}
+                    Ok(HarnessEvent::Approval { id, agent, tool, summary }) => {
+                        let session = map.lock().unwrap().session_of(agent);
+                        emit(
+                            &out,
+                            index,
+                            Frame::Request {
+                                id: json!(format!("a{id}")),
+                                method: "approval/request".into(),
+                                params: json!({
+                                    "sessionId": session,
+                                    "toolName": tool,
+                                    "reason": summary,
+                                }),
+                            },
+                        );
+                    }
+                    Ok(HarnessEvent::Question { id, agent, question, options }) => {
+                        let session = map.lock().unwrap().session_of(agent);
+                        emit(
+                            &out,
+                            index,
+                            Frame::Request {
+                                id: json!(format!("q{id}")),
+                                method: "user-question/ask".into(),
+                                params: json!({
+                                    "sessionId": session,
+                                    "question": question,
+                                    "options": options,
+                                }),
+                            },
+                        );
+                    }
                     Ok(HarnessEvent::Delta { .. }) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -333,6 +413,30 @@ fn emit(tx: &Sender<Msg>, project: usize, frame: Frame) {
 impl Backend for Local {
     fn send(&self, project: usize, frame: Value) {
         let method = frame["method"].as_str().unwrap_or("");
+        // answers to approval/question requests we issued ("a<id>" / "q<id>")
+        if method.is_empty()
+            && let Some(rid) = frame["id"].as_str()
+        {
+            let num = rid[1..].parse::<u64>().ok();
+            self.with_slot(project, |slot| {
+                let i = &slot.harness.interact;
+                match (rid.as_bytes().first(), num) {
+                    (Some(b'a'), Some(n)) => i.resolve_approval(
+                        n,
+                        match frame["result"]["outcome"].as_str() {
+                            Some("allowed-once") => Decision::Allow,
+                            Some("allowed-session") => Decision::AllowSession,
+                            _ => Decision::Reject,
+                        },
+                    ),
+                    (Some(b'q'), Some(n)) => {
+                        i.answer(n, frame["result"]["answer"].as_str().map(str::to_string))
+                    }
+                    _ => {}
+                }
+            });
+            return;
+        }
         let params = &frame["params"];
         let id = frame["id"].clone();
         match method {
@@ -475,6 +579,7 @@ impl Backend for Local {
             self.providers.clone(),
             &self.tx,
             self.persist,
+            self.approvals.load(std::sync::atomic::Ordering::Relaxed),
         );
         self.slots.lock().unwrap()[project] = Some(slot);
     }
@@ -495,6 +600,7 @@ impl Backend for Local {
             self.providers.clone(),
             &self.tx,
             self.persist,
+            self.approvals.load(std::sync::atomic::Ordering::Relaxed),
         );
         if let Some(s) = self.slots.lock().unwrap().get_mut(project) {
             *s = Some(slot);
@@ -562,5 +668,48 @@ impl Backend for Local {
                 h.interrupt();
             }
         });
+    }
+
+    fn set_approvals(&self, on: bool) {
+        self.approvals
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+        for slot in self.slots.lock().unwrap().iter().flatten() {
+            slot.harness.interact.set_approvals(on);
+        }
+    }
+
+    fn compact(&self, project: usize, session: &str) {
+        self.with_slot(project, |slot| {
+            if let Some(agent) = slot.sessions.lock().unwrap().agent(session)
+                && let Some(h) = slot.harness.get(agent)
+            {
+                h.compact();
+            }
+        });
+    }
+
+    fn add_provider(&self, id: &str) -> Result<(), String> {
+        let registry = destro_core::ProviderRegistry::load();
+        let provider = registry.build(id)?;
+        self.providers.insert(id, provider);
+        Ok(())
+    }
+
+    fn mcp_prompts(&self, project: usize) -> Vec<destro_core::mcp::McpPrompt> {
+        self.with_slot(project, |slot| slot.mcp.prompts())
+            .unwrap_or_default()
+    }
+
+    fn mcp_prompt(
+        &self,
+        project: usize,
+        server: &str,
+        name: &str,
+        args: serde_json::Map<String, Value>,
+    ) -> Result<String, String> {
+        let mcp = self
+            .with_slot(project, |slot| slot.mcp.clone())
+            .ok_or("no such workspace")?;
+        self.rt.block_on(mcp.get_prompt(server, name, args))
     }
 }

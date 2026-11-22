@@ -12,6 +12,7 @@ pub mod context;
 pub mod dsh;
 pub mod gate;
 pub mod harness;
+pub mod interact;
 pub mod mcp;
 pub mod provider;
 pub mod skills;
@@ -24,8 +25,9 @@ pub use bus::{EventBus, HarnessEvent};
 pub use destro_proto::Delivery;
 pub use gate::{Gate, Priority};
 pub use harness::{Harness, HarnessConfig, HarnessStats, ProviderSet, SpawnSpec};
+pub use interact::{Decision, Interact};
 pub use provider::{
     ChatRequest, MockProvider, MockToolCall, MockTurn, OpenAiCompatProvider, Provider,
     ProviderDescriptor, ProviderError, ProviderInfo, ProviderItem, ProviderKind, ProviderRegistry,
-    ProviderStream, SseEvent, SseParser, last_user_text, user_message,
+    ProviderStream, SseEvent, SseParser, key_of, last_user_text, save_key, user_message,
 };

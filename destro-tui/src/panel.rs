@@ -11,6 +11,8 @@ pub enum Kind {
     Mcp,
     Context,
     Resume,
+    Provider,
+    Search,
     ImportWorkspaces,
     /// Sessions of the dsh workspace at this index.
     ImportSessions(usize),

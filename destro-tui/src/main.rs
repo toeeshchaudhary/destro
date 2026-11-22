@@ -132,7 +132,7 @@ fn parse_args() -> Result<Args> {
                 let mode = match it.peek().map(String::as_str) {
                     Some(
                         "done" | "snippets" | "open" | "palette" | "themes" | "help" | "slash"
-                        | "fresh" | "model" | "context",
+                        | "fresh" | "model" | "context" | "question" | "textbox",
                     ) => it.next().unwrap(),
                     _ => String::new(),
                 };
@@ -258,6 +258,27 @@ fn snapshot(mode: &str) -> Result<()> {
             app.on_key(ratatui::crossterm::event::KeyEvent::from(
                 ratatui::crossterm::event::KeyCode::Enter,
             ));
+        }
+        "question" => app.on_frame(
+            0,
+            &json!({"jsonrpc":"2.0","id":"q9","method":"user-question/ask","params":{
+                "sessionId":"x","question":"Which database should the new session store use?",
+                "options":["SQLite (single file, no server)","Postgres (shared, needs setup)"]}})
+            .to_string(),
+        ),
+        "textbox" => {
+            app.textbox = Some(app::TextBox {
+                title: "API KEY · refuseless".into(),
+                hint:
+                    "stored as REFUSELESS_API_KEY in your Destro config; Enter saves, Esc cancels"
+                        .into(),
+                value: "sk-abcdef123456".into(),
+                secret: true,
+                purpose: app::TextPurpose::Rename {
+                    path: String::new(),
+                    sid: String::new(),
+                },
+            })
         }
         "context" => {
             app.input = "/context".into();
@@ -474,8 +495,18 @@ fn run_import_dsh(args: &Args) -> Result<()> {
             continue;
         }
         let (mut n, mut k, mut f) = (0, 0, 0);
-        for s in &w.sessions {
-            match destro_core::dsh::import_session(s, &w.path, args.force) {
+        let jobs: Vec<_> = w
+            .sessions
+            .iter()
+            .cloned()
+            .map(|s| (s, w.path.clone()))
+            .collect();
+        for (s, r) in w
+            .sessions
+            .iter()
+            .zip(destro_core::dsh::import_many(&jobs, args.force))
+        {
+            match r {
                 Ok(destro_core::dsh::Imported::New) => n += 1,
                 Ok(destro_core::dsh::Imported::AlreadyThere) => k += 1,
                 Err(e) => {
@@ -667,6 +698,10 @@ fn main() -> Result<()> {
     if !demo_mode {
         app.load_conventions();
         app.history = config::load_history();
+        if local_mode && config::load_approvals() {
+            app.approvals = true;
+            app.backend.set_approvals(true);
+        }
     }
     if local_mode {
         app.flash(format!("rust harness · provider {provider_label}"));

@@ -302,6 +302,14 @@ pub struct Approval {
     pub reason: Option<String>,
 }
 
+/// A question an agent asked the user (the `ask_user` tool).
+pub struct Question {
+    pub rpc_id: Value,
+    pub session_id: String,
+    pub question: String,
+    pub options: Vec<String>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Conn {
     Starting,
@@ -317,6 +325,7 @@ pub struct Project {
     pub sessions: Vec<Session>,
     pub index: HashMap<String, usize>,
     pub approvals: VecDeque<Approval>,
+    pub questions: VecDeque<Question>,
     pub log: VecDeque<String>,
     pub collapsed: bool,
     pub closed: bool,
@@ -334,6 +343,7 @@ impl Project {
             sessions: vec![],
             index: HashMap::new(),
             approvals: VecDeque::new(),
+            questions: VecDeque::new(),
             log: VecDeque::new(),
             collapsed: false,
             closed: false,

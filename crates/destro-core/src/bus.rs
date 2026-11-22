@@ -30,6 +30,20 @@ pub enum HarnessEvent {
         session_id: Arc<str>,
         event: Arc<Value>,
     },
+    /// An agent wants to run a tool and is waiting for the operator's decision.
+    Approval {
+        id: u64,
+        agent: AgentId,
+        tool: String,
+        summary: String,
+    },
+    /// An agent asked the operator a question and is waiting for the answer.
+    Question {
+        id: u64,
+        agent: AgentId,
+        question: String,
+        options: Vec<String>,
+    },
     /// Streaming text, for live transcripts. Not part of the durable log.
     Delta {
         agent: AgentId,

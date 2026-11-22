@@ -21,6 +21,7 @@ use crate::agent::{
 };
 use crate::bus::{EventBus, HarnessEvent};
 use crate::gate::{Gate, Priority};
+use crate::interact::Interact;
 use crate::provider::Provider;
 use crate::tools_ctl::{ToolHost, control_tools};
 
@@ -45,7 +46,7 @@ pub struct SpawnSpec {
 /// provider handle cannot express that. `resolve` splits a prefixed model, else
 /// falls back to the default provider and an unprefixed model.
 pub struct ProviderSet {
-    providers: HashMap<String, Arc<dyn Provider>>,
+    providers: RwLock<HashMap<String, Arc<dyn Provider>>>,
     default: String,
 }
 
@@ -55,16 +56,25 @@ impl ProviderSet {
         providers: HashMap<String, Arc<dyn Provider>>,
     ) -> Arc<ProviderSet> {
         Arc::new(ProviderSet {
-            providers,
+            providers: RwLock::new(providers),
             default: default.into(),
         })
+    }
+
+    /// Add or replace a provider while agents are running (a key entered late).
+    pub fn insert(&self, id: impl Into<String>, provider: Arc<dyn Provider>) {
+        self.providers.write().insert(id.into(), provider);
+    }
+
+    pub fn contains(&self, id: &str) -> bool {
+        self.providers.read().contains_key(id)
     }
 
     /// `(provider, model)`. Accepts `vendor/model` or `vendor:model`; unknown
     /// prefixes stay part of the model name.
     pub fn resolve(&self, model: &str) -> (Arc<dyn Provider>, String) {
         if let Some((prefix, rest)) = model.split_once('/').or_else(|| model.split_once(':'))
-            && let Some(provider) = self.providers.get(prefix)
+            && let Some(provider) = self.providers.read().get(prefix)
         {
             return (provider.clone(), rest.to_string());
         }
@@ -72,15 +82,15 @@ impl ProviderSet {
     }
 
     pub fn default_provider(&self) -> Arc<dyn Provider> {
-        self.providers
-            .get(&self.default)
-            .or_else(|| self.providers.values().next())
+        let map = self.providers.read();
+        map.get(&self.default)
+            .or_else(|| map.values().next())
             .cloned()
             .unwrap_or_else(|| Arc::new(crate::provider::MockProvider::echo()))
     }
 
-    pub fn ids(&self) -> Vec<&str> {
-        self.providers.keys().map(String::as_str).collect()
+    pub fn ids(&self) -> Vec<String> {
+        self.providers.read().keys().cloned().collect()
     }
 }
 
@@ -104,6 +114,9 @@ pub struct HarnessConfig {
     /// Slots inside `concurrency` reserved for interactive turns.
     pub interactive_reserve: usize,
     pub event_buffer: usize,
+    /// Compact an agent's history once a request's context reaches this many
+    /// tokens (0 disables automatic compaction).
+    pub compact_at: u64,
 }
 
 impl HarnessConfig {
@@ -121,6 +134,7 @@ impl HarnessConfig {
             concurrency: 24,
             interactive_reserve: 4,
             event_buffer: 8192,
+            compact_at: 100_000,
         }
     }
 }
@@ -149,6 +163,8 @@ pub struct Harness {
     pub slave_model: Option<String>,
     pub slave_system: Option<String>,
     pub providers: Option<Arc<ProviderSet>>,
+    pub interact: Arc<Interact>,
+    pub compact_at: u64,
 }
 
 impl Harness {
@@ -174,6 +190,8 @@ impl Harness {
             slave_model: cfg.slave_model,
             slave_system: cfg.slave_system,
             providers: cfg.providers,
+            interact: Arc::new(Interact::default()),
+            compact_at: cfg.compact_at,
         });
         let _ = tool_host.set(Arc::downgrade(&harness));
         harness
@@ -255,6 +273,8 @@ impl Harness {
             priority,
             history: spec.history,
             providers: self.providers.clone(),
+            interact: self.interact.clone(),
+            compact_at: self.compact_at,
         };
         tokio::spawn(AgentTask::new(init, cancel).run(rx));
 

@@ -88,8 +88,8 @@ pub struct Registry {
 impl Registry {
     /// Creates a registry containing every built-in tool.
     ///
-    /// The built-ins are `read`, `write`, `edit`, `glob`, `grep`, `pwsh` and
-    /// `echo`.
+    /// The built-ins are `read`, `write`, `edit`, `glob`, `grep`, `pwsh`,
+    /// `web_fetch`, `web_search`, `todo_write` and `echo`.
     pub fn builtin() -> Registry {
         let registry = Registry::default();
         registry.register(Arc::new(tools::ReadTool));
@@ -99,6 +99,9 @@ impl Registry {
         registry.register(Arc::new(tools::GrepTool));
         registry.register(Arc::new(tools::PwshTool));
         registry.register(Arc::new(tools::EchoTool));
+        registry.register(Arc::new(tools::WebFetchTool));
+        registry.register(Arc::new(tools::WebSearchTool));
+        registry.register(Arc::new(tools::TodoWriteTool));
         registry
     }
 
@@ -172,10 +175,21 @@ mod tests {
         let registry = Registry::builtin();
         assert_eq!(
             registry.names(),
-            vec!["echo", "edit", "glob", "grep", "pwsh", "read", "write"]
+            vec![
+                "echo",
+                "edit",
+                "glob",
+                "grep",
+                "pwsh",
+                "read",
+                "todo_write",
+                "web_fetch",
+                "web_search",
+                "write"
+            ]
         );
         let schemas = registry.schemas();
-        assert_eq!(schemas.len(), 7);
+        assert_eq!(schemas.len(), 10);
         assert_eq!(schemas[0]["name"], "echo");
         assert!(
             schemas

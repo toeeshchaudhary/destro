@@ -29,7 +29,9 @@ mod sse;
 
 pub use mock::{MockProvider, MockToolCall, MockTurn};
 pub use openai_compat::OpenAiCompatProvider;
-pub use registry::{ProviderDescriptor, ProviderInfo, ProviderKind, ProviderRegistry};
+pub use registry::{
+    ProviderDescriptor, ProviderInfo, ProviderKind, ProviderRegistry, key_of, save_key,
+};
 pub use sse::{SseEvent, SseParser};
 
 /// One model request. Messages use the neutral chat shape

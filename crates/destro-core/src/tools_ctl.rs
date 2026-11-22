@@ -24,7 +24,8 @@ pub fn control_tools(host: ToolHost) -> Vec<Arc<dyn Tool>> {
         Arc::new(ListAgentsTool { host: host.clone() }),
         Arc::new(SendMessageTool { host: host.clone() }),
         Arc::new(InterruptTool { host: host.clone() }),
-        Arc::new(WaitAgentTool { host }),
+        Arc::new(WaitAgentTool { host: host.clone() }),
+        Arc::new(AskUserTool { host }),
     ]
 }
 
@@ -79,6 +80,88 @@ fn format_agent(state: &destro_proto::AgentState) -> String {
         title,
         last
     )
+}
+
+// ---------------------------------------------------------------------------
+// ask_user
+// ---------------------------------------------------------------------------
+
+pub struct AskUserTool {
+    host: ToolHost,
+}
+
+impl Tool for AskUserTool {
+    fn name(&self) -> &str {
+        "ask_user"
+    }
+
+    fn description(&self) -> &str {
+        "Ask the user a concise question when you need a decision, a choice or missing \
+         information before you can continue. Offer `options` when the answers are a small set; \
+         the user can always type their own. If the answer comes back skipped, continue with a \
+         sensible default and do not ask the same thing again."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "question": { "type": "string", "description": "The question to show." },
+                "options": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional suggested answers."
+                }
+            },
+            "required": ["question"],
+        })
+    }
+
+    fn run<'a>(
+        &'a self,
+        inv: &'a ToolInvocation,
+        cx: &'a ToolContext,
+    ) -> BoxFuture<'a, ToolOutput> {
+        Box::pin(async move {
+            let harness = match upgrade(&self.host) {
+                Ok(h) => h,
+                Err(e) => return e,
+            };
+            if !harness.interact.attached() {
+                return ToolOutput::err(
+                    "no interactive user is attached; make a reasonable assumption and continue",
+                );
+            }
+            let question = match required_str(inv, "question") {
+                Ok(q) => q,
+                Err(e) => return e,
+            };
+            let options: Vec<String> = inv
+                .arguments
+                .get("options")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let agent = AgentId::parse(&cx.agent_id).unwrap_or(AgentId(0));
+            let (id, rx) = harness.interact.request_question();
+            harness.bus.publish(crate::bus::HarnessEvent::Question {
+                id,
+                agent,
+                question,
+                options,
+            });
+            match rx.await {
+                Ok(Some(answer)) => ToolOutput::ok(format!("The user answered: {answer}")),
+                _ => ToolOutput::ok(
+                    "The user skipped this question; continue with a sensible default and do not ask it again.",
+                ),
+            }
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -528,3 +528,110 @@ async fn non_object_arguments_are_reported_not_panicked() {
     assert!(!echo.is_error);
     assert_eq!(echo.content, "null");
 }
+
+// ----- web_fetch against a local server ------------------------------------------------------
+
+mod web {
+    use destro_tools::tools::WebFetchTool;
+    use destro_tools::{Tool, ToolContext, ToolInvocation};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// Serves canned responses by request path until the test ends.
+    async fn serve() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    let (status, ctype, body, extra) = match path.as_str() {
+                        "/page" => (
+                            "200 OK",
+                            "text/html",
+                            "<html><body><h1>Hi</h1><p>Body &amp; text</p></body></html>",
+                            "",
+                        ),
+                        "/data" => ("200 OK", "application/json", "{\"a\":1}", ""),
+                        "/bin" => ("200 OK", "image/png", "xx", ""),
+                        "/go" => ("302 Found", "text/plain", "", "Location: /page\r\n"),
+                        _ => ("404 Not Found", "text/plain", "nope", ""),
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    async fn fetch(url: String) -> destro_tools::ToolOutput {
+        WebFetchTool
+            .run(
+                &ToolInvocation {
+                    call_id: "1".into(),
+                    arguments: serde_json::json!({"url": url}),
+                },
+                &ToolContext {
+                    cwd: std::env::temp_dir(),
+                    agent_id: "a".into(),
+                },
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn fetch_converts_html_follows_redirects_and_reports_errors() {
+        let base = serve().await;
+        let ok = fetch(format!("{base}/page")).await;
+        assert!(!ok.is_error, "{}", ok.content);
+        assert!(
+            ok.content.contains("Hi") && ok.content.contains("Body & text"),
+            "{}",
+            ok.content
+        );
+        assert!(!ok.content.contains("<h1>"));
+
+        let json = fetch(format!("{base}/data")).await;
+        assert!(json.content.contains("{\"a\":1}"));
+
+        let redirected = fetch(format!("{base}/go")).await;
+        assert!(redirected.content.contains("Body & text") && redirected.content.contains("/page"));
+
+        assert!(
+            fetch(format!("{base}/missing"))
+                .await
+                .content
+                .contains("404")
+        );
+        assert!(
+            fetch(format!("{base}/bin"))
+                .await
+                .content
+                .contains("not a text")
+        );
+        assert!(fetch("file:///etc/passwd".into()).await.is_error);
+        let bad = WebFetchTool
+            .run(
+                &ToolInvocation {
+                    call_id: "1".into(),
+                    arguments: serde_json::json!({}),
+                },
+                &ToolContext {
+                    cwd: std::env::temp_dir(),
+                    agent_id: "a".into(),
+                },
+            )
+            .await;
+        assert!(bad.is_error);
+    }
+}

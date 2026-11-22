@@ -8,6 +8,7 @@ mod files;
 mod search;
 mod shell;
 mod text;
+mod web;
 
 pub use editing::EditTool;
 pub use files::ReadTool;
@@ -16,3 +17,7 @@ pub use search::GlobTool;
 pub use search::GrepTool;
 pub use shell::PwshTool;
 pub use text::EchoTool;
+pub use web::{
+    Hit, TodoWriteTool, WebFetchTool, WebSearchTool, decode_entities, html_to_text, parse_brave,
+    parse_ddg, parse_searxng, parse_tavily,
+};
