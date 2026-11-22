@@ -16,6 +16,8 @@ pub enum Msg {
     Frame { project: usize, line: String },
     /// Runtime stderr line (diagnostics).
     Stderr { project: usize, line: String },
+    /// A local conversation could no longer be saved.
+    SessionSaveFailed { project: usize, message: String },
     /// Provider balance poll result.
     Balance(Result<crate::balance::Info, String>),
     /// Runtime ended or failed to start.

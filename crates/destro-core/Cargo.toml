@@ -13,6 +13,7 @@ tokio-util.workspace = true
 futures-core.workspace = true
 futures-util.workspace = true
 parking_lot.workspace = true
+regex.workspace = true
 # Declared directly: the workspace entry names the `rustls-tls` feature, which
 # reqwest 0.13 renamed to `rustls`, so `reqwest.workspace = true` would fail.
 # reqwest 0.13 renamed the rustls feature to `rustls`; the root workspace

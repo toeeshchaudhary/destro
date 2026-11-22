@@ -5,7 +5,7 @@
 //! agents must never apply backpressure to the agent loop. Subscribers that fall
 //! behind get `Lagged` and re-sync from [`crate::Harness::list`].
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use serde_json::Value;
 use tokio::sync::broadcast;
@@ -61,12 +61,23 @@ pub enum HarnessEvent {
 #[derive(Clone)]
 pub struct EventBus {
     tx: broadcast::Sender<HarnessEvent>,
+    session_sink: Arc<OnceLock<Box<SessionSink>>>,
 }
+
+type SessionSink = dyn Fn(AgentId, &Value) + Send + Sync;
 
 impl EventBus {
     pub fn new(capacity: usize) -> EventBus {
         let (tx, _) = broadcast::channel(capacity.max(16));
-        EventBus { tx }
+        EventBus {
+            tx,
+            session_sink: Arc::default(),
+        }
+    }
+
+    /// Install a synchronous session sink before starting agents.
+    pub fn set_session_sink(&self, sink: impl Fn(AgentId, &Value) + Send + Sync + 'static) {
+        assert!(self.session_sink.set(Box::new(sink)).is_ok());
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<HarnessEvent> {
@@ -81,15 +92,20 @@ impl EventBus {
         let _ = self.tx.send(event);
     }
 
-    /// Publish a durable session event, serialising only when someone listens.
+    /// Save a session event before delivering it to live observers.
     pub fn session(&self, agent: AgentId, session_id: &Arc<str>, event: SessionEvent) {
-        if self.tx.receiver_count() == 0 {
+        let sink = self.session_sink.get();
+        if sink.is_none() && self.tx.receiver_count() == 0 {
             return;
+        }
+        let event = event.to_value();
+        if let Some(save) = sink {
+            save(agent, &event);
         }
         self.publish(HarnessEvent::Session {
             agent,
             session_id: session_id.clone(),
-            event: Arc::new(event.to_value()),
+            event: Arc::new(event),
         });
     }
 
@@ -102,5 +118,41 @@ impl EventBus {
             reasoning,
             text: Arc::from(text),
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{self, SessionWriter};
+    use parking_lot::Mutex;
+
+    #[test]
+    fn lagging_observer_does_not_lose_saved_events() {
+        let path = std::env::temp_dir().join(format!("destro-bus-{}.jsonl", std::process::id()));
+        let writer =
+            Mutex::new(SessionWriter::open_at(&path, "/w", "chat", "m", "destro").unwrap());
+        let bus = EventBus::new(16);
+        bus.set_session_sink(move |_, event| writer.lock().append(event).unwrap());
+        let mut observer = bus.subscribe();
+        let session: Arc<str> = "chat".into();
+        for i in 0..64 {
+            bus.session(
+                AgentId(1),
+                &session,
+                SessionEvent::Notice {
+                    text: i.to_string(),
+                },
+            );
+        }
+        assert!(matches!(
+            observer.try_recv(),
+            Err(broadcast::error::TryRecvError::Lagged(_))
+        ));
+        let events = store::load(&path);
+        drop(bus);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(events.len(), 64);
+        assert_eq!(events[63]["data"]["text"], "63");
     }
 }

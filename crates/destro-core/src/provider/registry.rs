@@ -313,6 +313,10 @@ impl ProviderRegistry {
     /// The id to start with: the first configured non-mock provider, else
     /// `"mock"`.
     pub fn default_id(&self) -> String {
+        self.default_id_with(|var| key_of(var).is_some())
+    }
+
+    fn default_id_with(&self, has_key: impl Fn(&str) -> bool) -> String {
         self.providers
             .iter()
             .find(|descriptor| {
@@ -320,7 +324,7 @@ impl ProviderRegistry {
                     && descriptor
                         .api_key_env
                         .as_ref()
-                        .is_none_or(|var| key_of(var).is_some())
+                        .is_none_or(|var| has_key(var))
             })
             .map(|descriptor| descriptor.id.clone())
             .unwrap_or_else(|| "mock".to_string())
@@ -505,7 +509,11 @@ mod tests {
         );
         let registry = ProviderRegistry::load_from(&path).expect("config loads");
         fs::remove_file(&path).ok();
-        assert_eq!(registry.default_id(), "local-llama");
+        assert_eq!(registry.default_id_with(|_| false), "local-llama");
+        assert_eq!(
+            registry.default_id_with(|var| var == "DEEPSEEK_API_KEY"),
+            "deepseek"
+        );
 
         // With no configured non-mock provider, mock is the fallback.
         let only_mock = ProviderRegistry {

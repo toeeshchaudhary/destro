@@ -276,8 +276,6 @@ impl Harness {
             interact: self.interact.clone(),
             compact_at: self.compact_at,
         };
-        tokio::spawn(AgentTask::new(init, cancel).run(rx));
-
         self.agents.write().insert(id, handle.clone());
         if let Some(p) = &parent_handle {
             p.live.bump_children(1);
@@ -287,6 +285,7 @@ impl Harness {
             parent,
             title: spec.title,
         });
+        tokio::spawn(AgentTask::new(init, cancel).run(rx));
         if let Some(prompt) = spec.prompt {
             handle.send(prompt, Delivery::Queue)?;
         }

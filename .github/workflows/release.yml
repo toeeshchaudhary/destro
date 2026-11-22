@@ -9,8 +9,12 @@ permissions:
   contents: write
 
 jobs:
+  checks:
+    uses: ./.github/workflows/checks.yml
+
   release:
     name: build and publish
+    needs: checks
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -20,7 +24,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build release binaries
-        run: cargo build --release --workspace
+        run: cargo build --release --workspace --locked
 
       - name: Publish GitHub release
         shell: pwsh
