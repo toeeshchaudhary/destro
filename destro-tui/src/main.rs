@@ -528,7 +528,49 @@ fn run_import_dsh(args: &Args) -> Result<()> {
 }
 
 fn run_update() -> Result<()> {
-    match updater::update("destro", updater::target_triple()) {
+    println!("checking for updates…");
+    let started = Instant::now();
+    let mut last_draw = Instant::now() - Duration::from_secs(1);
+    let mut progress = |done: u64, total: Option<u64>| {
+        // redraw ~10x a second at most; always draw the final state
+        if last_draw.elapsed() < Duration::from_millis(100) && Some(done) != total {
+            return;
+        }
+        last_draw = Instant::now();
+        let mb = |b: u64| b as f64 / 1_048_576.0;
+        let secs = started.elapsed().as_secs_f64().max(0.001);
+        let rate = done as f64 / secs; // bytes per second
+        match total {
+            Some(t) if t > 0 => {
+                let frac = (done as f64 / t as f64).clamp(0.0, 1.0);
+                let width = 28usize;
+                let filled = (frac * width as f64).round() as usize;
+                let eta = if rate > 1.0 && done < t {
+                    let left = ((t - done) as f64 / rate) as u64;
+                    format!(" · {}:{:02} left", left / 60, left % 60)
+                } else {
+                    String::new()
+                };
+                eprint!(
+                    "\r  [{}{}] {:>3}%  {:.1}/{:.1} MB  {:.0} KB/s{eta}   ",
+                    "█".repeat(filled),
+                    "░".repeat(width - filled),
+                    (frac * 100.0) as u32,
+                    mb(done),
+                    mb(t),
+                    rate / 1024.0,
+                );
+            }
+            _ => eprint!(
+                "\r  downloading {:.1} MB  {:.0} KB/s   ",
+                mb(done),
+                rate / 1024.0
+            ),
+        }
+    };
+    let outcome = updater::update_with("destro", updater::target_triple(), &mut progress);
+    eprintln!();
+    match outcome {
         Ok(updater::UpdateOutcome::UpToDate { current, latest }) => {
             println!("destro {current} is current (latest {latest})");
         }

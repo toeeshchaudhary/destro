@@ -207,6 +207,15 @@ pub fn parse_release(json: &str) -> Result<Release, String> {
 /// Check for a newer release, download the matching asset and replace the
 /// running executable in place.
 pub fn update(binary: &str, triple: &str) -> Result<UpdateOutcome, String> {
+    update_with(binary, triple, &mut |_, _| {})
+}
+
+/// [`update`], reporting download progress as `(bytes so far, total if known)`.
+pub fn update_with(
+    binary: &str,
+    triple: &str,
+    progress: &mut dyn FnMut(u64, Option<u64>),
+) -> Result<UpdateOutcome, String> {
     let current = Version::parse(CURRENT_VERSION).unwrap_or(Version(0, 0, 0));
 
     let release = fetch_latest(REPO).map_err(|err| format!("check for updates: {err}"))?;
@@ -230,7 +239,7 @@ pub fn update(binary: &str, triple: &str) -> Result<UpdateOutcome, String> {
             )
         })?;
 
-    let bytes = download(&url).map_err(|err| format!("download {wanted}: {err}"))?;
+    let bytes = download(&url, progress).map_err(|err| format!("download {wanted}: {err}"))?;
 
     let target =
         std::env::current_exe().map_err(|err| format!("locate current executable: {err}"))?;
@@ -247,9 +256,16 @@ pub fn update(binary: &str, triple: &str) -> Result<UpdateOutcome, String> {
     })
 }
 
-fn download(url: &str) -> Result<Vec<u8>, String> {
+fn download(url: &str, progress: &mut dyn FnMut(u64, Option<u64>)) -> Result<Vec<u8>, String> {
+    use std::io::Read;
     let ua = user_agent();
-    let result = ureq::get(url).header("User-Agent", &ua).call();
+    // a slow link is fine; a dead one must not hang forever
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_connect(Some(std::time::Duration::from_secs(20)))
+        .timeout_global(Some(std::time::Duration::from_secs(45 * 60)))
+        .build()
+        .into();
+    let result = agent.get(url).header("User-Agent", &ua).call();
 
     let mut response = match result {
         Ok(response) => response,
@@ -264,16 +280,37 @@ fn download(url: &str) -> Result<Vec<u8>, String> {
     if !(200..300).contains(&status) {
         return Err(format!("HTTP {status}"));
     }
+    let total = response
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
 
-    response
+    let mut reader = response
         .body_mut()
         .with_config()
         .limit(MAX_DOWNLOAD_BYTES)
-        .read_to_vec()
-        .map_err(|err| format!("reading body: {err}"))
+        .reader();
+    let mut out = Vec::with_capacity(total.unwrap_or(0).min(MAX_DOWNLOAD_BYTES) as usize);
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let n = reader
+            .read(&mut chunk)
+            .map_err(|err| format!("reading body: {err}"))?;
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&chunk[..n]);
+        progress(out.len() as u64, total);
+    }
+    if let Some(t) = total
+        && out.len() as u64 != t
+    {
+        return Err(format!("incomplete download ({} of {t} bytes)", out.len()));
+    }
+    Ok(out)
 }
 
-/// Append a literal suffix to a path (`destro.exe` -> `destro.exe.new`).
 fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut os = path.as_os_str().to_os_string();
     os.push(suffix);
