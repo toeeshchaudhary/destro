@@ -8,6 +8,7 @@ mod local;
 mod md;
 mod model;
 mod panel;
+mod shot;
 mod theme;
 mod ui;
 mod updater;
@@ -56,6 +57,8 @@ OPTIONS
   --providers       same as `providers`
   import-dsh [--list] [--force] [--dsh-home <dir>]
                     import every DeepSeek Harness chat (see /import in the TUI)
+  --svg             with --snapshot: write the frame as an SVG screenshot
+  --size <WxH>      snapshot size in cells (default 150x42)
   --theme <name>    colour theme (else the saved choice; Ctrl+T in the TUI)
   --version         print the version and exit
 ENV
@@ -79,6 +82,8 @@ struct Args {
     providers: bool,
     theme: Option<String>,
     prompt: Option<String>,
+    svg: bool,
+    size: Option<(u16, u16)>,
     import_dsh: bool,
     list: bool,
     force: bool,
@@ -103,6 +108,8 @@ fn parse_args() -> Result<Args> {
         providers: false,
         theme: None,
         prompt: None,
+        svg: false,
+        size: None,
         import_dsh: false,
         list: false,
         force: false,
@@ -126,6 +133,13 @@ fn parse_args() -> Result<Args> {
             "--theme" => a.theme = it.next(),
             "import-dsh" | "--import-dsh" => a.import_dsh = true,
             "--list" => a.list = true,
+            "--svg" => a.svg = true,
+            "--size" => {
+                a.size = it.next().and_then(|v| {
+                    let (w, h) = v.split_once('x')?;
+                    Some((w.parse().ok()?, h.parse().ok()?))
+                })
+            }
             "--force" => a.force = true,
             "--dsh-home" => a.dsh_home = it.next(),
             "--snapshot" => {
@@ -166,6 +180,49 @@ fn parse_args() -> Result<Args> {
     Ok(a)
 }
 
+/// The scripted demo uses the author's own project names; screenshots and docs
+/// get generic ones.
+fn sanitise_demo(app: &mut App) {
+    let names = [
+        ("web-app", "~/code/web-app"),
+        ("billing-api", "~/code/billing-api"),
+        ("firmware", "~/code/firmware"),
+    ];
+    let titles: [&[&str]; 3] = [
+        &[],
+        &[
+            "Rate-limit the public endpoints",
+            "Move invoices to decimal money",
+        ],
+        &["Debounce the sensor read loop"],
+    ];
+    // the first workspace's subagents are named after the author's project
+    {
+        let kid_titles = [
+            "Map every call site",
+            "Run the test suite",
+            "Inspect the session store",
+        ];
+        let p = &mut app.projects[0];
+        let mut n = 0;
+        for se in p.sessions.iter_mut() {
+            if se.parent.is_some() {
+                se.title = Some(kid_titles[n % kid_titles.len()].into());
+                n += 1;
+            }
+        }
+    }
+    for (i, p) in app.projects.iter_mut().enumerate().take(3) {
+        p.name = names[i].0.into();
+        p.cwd = names[i].1.into();
+        for (j, t) in titles[i].iter().enumerate() {
+            if let Some(se) = p.sessions.get_mut(j) {
+                se.title = Some((*t).into());
+            }
+        }
+    }
+}
+
 fn demo_projects() -> Vec<Project> {
     vec![
         Project::new("kuro-site", "~/Documents/kuro-site", "deepseek-v4-pro"),
@@ -202,7 +259,7 @@ impl Backend for NullBackend {
 }
 
 /// Drive the demo script synchronously through the same `on_frame` parser the live path uses.
-fn snapshot(mode: &str) -> Result<()> {
+fn snapshot(mode: &str, args: &Args) -> Result<()> {
     let (tx, _rx) = mpsc::channel();
     let mut app = App::new(demo_projects(), Box::new(NullBackend(tx)));
     app.on_msg(Msg::Balance(balance::parse(
@@ -260,30 +317,38 @@ fn snapshot(mode: &str) -> Result<()> {
             ));
         }
         "swarm" => {
-            // one chat that spawned many same-looking subagents, a few still working
+            // one chat that spawned several subagents, some still working
             let pr = &mut app.projects[0];
             let root = pr.session_mut("root");
-            pr.sessions[root].title = Some("GTA6 Xbox build executable audit".into());
+            let user = json!({"type":"user/message","data":{"content":[{"type":"text",
+                "text":"Audit the payments service for security problems and give me a ranked report."}],
+                "source":{"kind":"user"}}});
+            let reply = json!({"type":"assistant/message","data":{"message":{"content":[
+                {"type":"reasoning","text":"Four independent areas: auth flow, dependencies, SQL, rate limits. Fan out, then merge and rank."},
+                {"type":"text","text":"I split the audit across four subagents and merged what came back.\n\n## Findings\n\n| Area | Severity | Finding |\n|:-----|:--------:|:--------|\n| Auth flow | **high** | refresh tokens never expire |\n| SQL | **high** | `ORDER BY` built from a query param |\n| Dependencies | medium | 2 packages with known CVEs |\n| Rate limits | low | no limit on `/health` |\n\n- [x] traced every call to `authenticate()`\n- [x] scanned `Cargo.lock` against advisories\n- [ ] fix the two **high** items — see [the report](https://example.com/audit)\n\n> Start with the refresh-token fix: it is a one-line change.\n"}]},
+                "usage":{"inputTokens":18400,"outputTokens":420,"cacheReadTokens":9100}}});
+            for ev in [&user, &reply] {
+                pr.sessions[root].apply_event(ev);
+            }
+            pr.sessions[root].title = Some("Payments service security audit".into());
             pr.sessions[root].status = model::Status::Running;
+            let labels = [
+                "Trace the auth flow",
+                "Scan dependencies",
+                "Review SQL queries",
+                "Check rate limits",
+            ];
             for i in 0..14 {
                 let id = format!("kid-{i}");
                 let ci = pr.session_mut(&id);
                 pr.sessions[ci].parent = Some("root".into());
-                pr.sessions[ci].title = Some(
-                    [
-                        "XVD format spec",
-                        "Extract game exe",
-                        "Entropy scan",
-                        "Find CIK keys",
-                    ][i % 4]
-                        .into(),
-                );
+                pr.sessions[ci].title = Some(labels[i % 4].into());
                 pr.sessions[ci].status = match i {
                     3 | 9 => model::Status::Running,
                     6 => model::Status::Failed,
                     _ => model::Status::Idle,
                 };
-                pr.sessions[ci].last_tool = Some("pwsh".into());
+                pr.sessions[ci].last_tool = Some(["grep", "read", "pwsh"][i % 3].into());
             }
             app.cur_project = 0;
             app.cur_session = Some(root);
@@ -318,8 +383,15 @@ fn snapshot(mode: &str) -> Result<()> {
         "fresh" => app.cur_session = None,
         _ => {}
     }
+    sanitise_demo(&mut app);
     app.tick = 3;
-    println!("{}", render_to_string(&mut app, 150, 42)?);
+    let (w, h) = args.size.unwrap_or((150, 42));
+    if args.svg {
+        let title = format!("destro — {}", app.projects[app.cur_project].name);
+        print!("{}", shot::svg(&mut app, w, h, &title));
+    } else {
+        println!("{}", render_to_string(&mut app, w, h)?);
+    }
     Ok(())
 }
 
@@ -676,7 +748,7 @@ fn main() -> Result<()> {
         }
     }
     if let Some(mode) = &args.snapshot {
-        return snapshot(mode);
+        return snapshot(mode, &args);
     }
     if let Some(n) = args.bench {
         return bench(n, args.hold);

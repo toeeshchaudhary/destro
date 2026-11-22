@@ -567,7 +567,19 @@ fn draw_main(f: &mut Frame, app: &mut App, area: Rect) {
             ));
             head.push(Span::raw(" "));
         }
-        head.push(Span::styled(truncate(&se.label(), 40), theme::text()));
+        // the title yields to everything after it, so "working" is never cut off
+        let used: usize = head.iter().map(|x| x.content.width()).sum();
+        let tail = 3
+            + format!("turn {} · {}", se.turn, pr.model).width()
+            + if se.status == Status::Running { 14 } else { 0 }
+            + if se.scroll > 0 { 16 } else { 0 };
+        let bal_w = balance_header(&app.balance)
+            .map(|x| x.content.width())
+            .unwrap_or(0);
+        let room = (rows[0].width as usize)
+            .saturating_sub(used + tail + bal_w + 2)
+            .clamp(10, 48);
+        head.push(Span::styled(truncate(&se.label(), room), theme::text()));
         head.push(Span::styled(
             format!("   turn {} · {}", se.turn, pr.model),
             theme::muted(),
@@ -1109,7 +1121,7 @@ fn draw_right(f: &mut Frame, app: &App, area: Rect) {
     }
     if hidden > 0 {
         l.push(Line::styled(
-            format!("  … {hidden} finished hidden · Ctrl+E all"),
+            format!("  +{hidden} finished · Ctrl+E shows"),
             theme::muted(),
         ));
     }
@@ -1448,7 +1460,7 @@ fn draw_theme_picker(f: &mut Frame, app: &App, area: Rect) {
     let inner = modal(
         f,
         area,
-        50,
+        56,
         (THEMES.len() as u16)
             .min(area.height.saturating_sub(8))
             .max(4)
@@ -1467,7 +1479,7 @@ fn draw_theme_picker(f: &mut Frame, app: &App, area: Rect) {
             Line::from(vec![
                 Span::styled(if sel { " ▸ " } else { "   " }, theme::accent_b()),
                 Span::styled(
-                    format!("{:<13}", t.name),
+                    format!("{:<16}", t.name),
                     if sel { theme::bold() } else { theme::text() },
                 ),
                 sw(t.accent),
