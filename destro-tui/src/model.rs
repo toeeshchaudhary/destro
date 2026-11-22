@@ -82,6 +82,8 @@ pub struct Session {
     pub tool_names: HashMap<String, (String, Option<String>)>,
     pub snippets: Vec<Snippet>,
     pub cache: crate::ui::LineCache,
+    /// When the current turn began (drives the elapsed-time readout).
+    pub started: Option<std::time::Instant>,
 }
 
 impl Session {
@@ -102,6 +104,7 @@ impl Session {
             tool_names: HashMap::new(),
             snippets: vec![],
             cache: Default::default(),
+            started: None,
         }
     }
 
@@ -317,6 +320,8 @@ pub struct Project {
     pub log: VecDeque<String>,
     pub collapsed: bool,
     pub closed: bool,
+    pub skills: Vec<destro_core::skills::Skill>,
+    pub commands: Vec<destro_core::skills::CustomCommand>,
 }
 
 impl Project {
@@ -332,7 +337,16 @@ impl Project {
             log: VecDeque::new(),
             collapsed: false,
             closed: false,
+            skills: vec![],
+            commands: vec![],
         }
+    }
+
+    /// Discover skills and custom commands for this workspace.
+    pub fn load_conventions(&mut self) {
+        let root = std::path::PathBuf::from(&self.cwd);
+        self.skills = destro_core::skills::discover_skills(&root);
+        self.commands = destro_core::skills::discover_commands(&root);
     }
 
     pub fn session_mut(&mut self, id: &str) -> usize {

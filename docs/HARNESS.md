@@ -19,7 +19,9 @@ next phases must add to reach feature parity with dsh.
 | Filesystem, search, shell tools | working (`read`, `write`, `edit`, `glob`, `grep`, `pwsh`) |
 | Self-updater + release workflow | working |
 | Context accounting | usage only |
-| Compaction, skills, MCP, sandbox, resume, approvals | not yet — phase 3 |
+| Instruction files (`AGENTS.md`/`CLAUDE.md`), skills, custom commands, MCP client | working — see [CONVENTIONS.md](CONVENTIONS.md) |
+| Session persistence, `/resume`, dsh chat import, model switching | working |
+| Compaction, sandbox, approvals | not yet — phase 3 |
 
 Provider vendors are configuration, not code: see
 [PROVIDERS.md](PROVIDERS.md). Advisor mode is described in

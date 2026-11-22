@@ -348,6 +348,7 @@ async fn dispatch(server: &Arc<Server>, method: &str, params: Value) -> Option<V
                 cwd: None,
                 prompt: spawn.prompt,
                 priority: None,
+                history: Vec::new(),
             };
             match server.harness.spawn(parent, spec) {
                 Ok(handle) => Some(json!({

@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use crate::backend::{Backend, Msg, ProjectSpec};
 use crate::balance::Balance;
 use crate::model::{Approval, Conn, Item, Project, Status};
+use crate::panel::{self, Kind, Panel, Tone};
 use crate::theme;
 use crate::ui::wrap;
 
@@ -46,11 +47,23 @@ pub struct Cmd {
     pub arg: bool,
 }
 
-pub const COMMANDS: [Cmd; 13] = [
+pub const COMMANDS: &[Cmd] = &[
     Cmd {
         name: "/new",
         keys: "Alt+N",
         desc: "start a new session in this workspace",
+        arg: false,
+    },
+    Cmd {
+        name: "/resume",
+        keys: "Alt+R",
+        desc: "continue a saved session",
+        arg: false,
+    },
+    Cmd {
+        name: "/model",
+        keys: "Alt+M",
+        desc: "switch model or provider (or /model <route>)",
         arg: false,
     },
     Cmd {
@@ -69,6 +82,36 @@ pub const COMMANDS: [Cmd; 13] = [
         name: "/theme",
         keys: "Ctrl+T",
         desc: "pick a colour theme (or /theme <name>)",
+        arg: false,
+    },
+    Cmd {
+        name: "/skills",
+        keys: "",
+        desc: "browse skills and custom commands",
+        arg: false,
+    },
+    Cmd {
+        name: "/mcp",
+        keys: "",
+        desc: "MCP servers: approve, enable, reconnect",
+        arg: false,
+    },
+    Cmd {
+        name: "/context",
+        keys: "",
+        desc: "show the AGENTS.md / CLAUDE.md files in use",
+        arg: false,
+    },
+    Cmd {
+        name: "/import",
+        keys: "",
+        desc: "bring in chats from DeepSeek Harness (dsh)",
+        arg: false,
+    },
+    Cmd {
+        name: "/export",
+        keys: "",
+        desc: "save this session as Markdown",
         arg: false,
     },
     Cmd {
@@ -91,8 +134,8 @@ pub const COMMANDS: [Cmd; 13] = [
     },
     Cmd {
         name: "/copy",
-        keys: "Ctrl+Y",
-        desc: "copy the newest code snippet",
+        keys: "",
+        desc: "copy the last reply",
         arg: false,
     },
     Cmd {
@@ -126,6 +169,23 @@ pub const COMMANDS: [Cmd; 13] = [
         arg: false,
     },
 ];
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EntryKind {
+    Builtin,
+    Skill,
+    Command,
+}
+
+/// One row of the `/` popup or palette: a built-in, a skill, or a custom command.
+#[derive(Clone, Debug)]
+pub struct Entry {
+    pub name: String,
+    pub keys: String,
+    pub desc: String,
+    pub arg: bool,
+    pub kind: EntryKind,
+}
 
 /// Ctrl+P command palette state.
 pub struct Palette {
@@ -205,6 +265,15 @@ pub struct App {
     pub themes: Option<ThemePick>,
     /// Highlighted row of the `/` suggestion popup.
     pub slash_sel: usize,
+    pub panel: Option<Panel>,
+    /// dsh workspaces found by the last `/import` scan.
+    pub dsh: Vec<destro_core::dsh::DshWorkspace>,
+    /// Channel back into the main loop for background work (imports).
+    pub tx: Option<std::sync::mpsc::Sender<Msg>>,
+    pub history: Vec<String>,
+    hist_pos: Option<usize>,
+    hist_draft: String,
+    last_char: Option<Instant>,
     /// Model names offered by the selected provider.
     pub model_suggestions: Vec<String>,
     tab: Option<TabState>,
@@ -239,6 +308,13 @@ impl App {
             palette: None,
             themes: None,
             slash_sel: 0,
+            panel: None,
+            dsh: vec![],
+            tx: None,
+            history: vec![],
+            hist_pos: None,
+            hist_draft: String::new(),
+            last_char: None,
             model_suggestions: MODEL_SUGGESTIONS.iter().map(|s| s.to_string()).collect(),
             tab: None,
             next_rpc: 1,
@@ -345,6 +421,30 @@ impl App {
                     Err(why) => Balance::Err { why, last: prev },
                 };
             }
+            Msg::Imported {
+                cwd,
+                new,
+                skipped,
+                failed,
+            } => {
+                let mut note = format!("imported {new} chat{}", if new == 1 { "" } else { "s" });
+                if skipped > 0 {
+                    note.push_str(&format!(" · {skipped} already there"));
+                }
+                if failed > 0 {
+                    note.push_str(&format!(" · {failed} failed"));
+                }
+                if std::path::Path::new(&cwd).is_dir() {
+                    let open = self.projects.iter().position(|p| !p.closed && p.cwd == cwd);
+                    if open.is_none() && self.open_workspace(&cwd).is_ok() {
+                        note.push_str(" · workspace opened");
+                    }
+                    note.push_str(" · /resume to continue");
+                } else {
+                    note.push_str(" · folder no longer exists; /open it to continue");
+                }
+                self.flash(note);
+            }
             Msg::Exited { project, why } => {
                 let p = &mut self.projects[project];
                 p.conn = Conn::Dead;
@@ -426,7 +526,15 @@ impl App {
             "session.status" => {
                 let sid = params["sessionId"].as_str().unwrap_or("");
                 let si = proj.session_mut(sid);
-                proj.sessions[si].status = if params["status"] == "running" {
+                let running = params["status"] == "running";
+                let se = &mut proj.sessions[si];
+                if running && se.status != Status::Running {
+                    se.started = Some(Instant::now());
+                }
+                if !running {
+                    se.started = None;
+                }
+                se.status = if running {
                     Status::Running
                 } else {
                     Status::Idle
@@ -583,35 +691,74 @@ impl App {
 
     // ----- commands, palette, themes ----------------------------------------------------
 
-    /// Commands matching what is typed after a leading `/` (no space yet).
-    pub fn slash_matches(&self) -> Vec<&'static Cmd> {
+    /// Built-ins, then this workspace's skills and custom commands.
+    pub fn entries(&self) -> Vec<Entry> {
+        let mut v: Vec<Entry> = COMMANDS
+            .iter()
+            .map(|c| Entry {
+                name: c.name.into(),
+                keys: c.keys.into(),
+                desc: c.desc.into(),
+                arg: c.arg,
+                kind: EntryKind::Builtin,
+            })
+            .collect();
+        let pr = &self.projects[self.cur_project];
+        for c in &pr.commands {
+            v.push(Entry {
+                name: format!("/{}", c.name),
+                keys: "command".into(),
+                desc: c.description.clone(),
+                arg: true,
+                kind: EntryKind::Command,
+            });
+        }
+        for k in &pr.skills {
+            v.push(Entry {
+                name: format!("/{}", k.name),
+                keys: "skill".into(),
+                desc: k.description.clone(),
+                arg: true,
+                kind: EntryKind::Skill,
+            });
+        }
+        let mut seen = std::collections::HashSet::new();
+        v.retain(|e| seen.insert(e.name.clone()));
+        v
+    }
+
+    /// Entries matching what is typed after a leading `/` (no space yet).
+    pub fn slash_matches(&self) -> Vec<Entry> {
         let t = self.input.as_str();
         if !t.starts_with('/') || t.contains(' ') || t.contains('\n') {
             return vec![];
         }
         let q = t.to_lowercase();
-        COMMANDS.iter().filter(|c| c.name.starts_with(&q)).collect()
+        self.entries()
+            .into_iter()
+            .filter(|c| c.name.to_lowercase().starts_with(&q))
+            .collect()
     }
 
-    pub fn palette_matches(&self) -> Vec<&'static Cmd> {
+    pub fn palette_matches(&self) -> Vec<Entry> {
         let q = self
             .palette
             .as_ref()
             .map(|p| p.query.trim().trim_start_matches('/').to_lowercase())
             .unwrap_or_default();
-        COMMANDS
-            .iter()
+        self.entries()
+            .into_iter()
             .filter(|c| {
                 q.is_empty()
-                    || c.name.trim_start_matches('/').contains(&q)
+                    || c.name.trim_start_matches('/').to_lowercase().contains(&q)
                     || c.desc.to_lowercase().contains(&q)
             })
             .collect()
     }
 
-    /// Put a command in the prompt. Arg-taking commands wait for their argument;
-    /// others complete (Tab) or run (Enter / palette).
-    fn run_cmd(&mut self, c: &Cmd, run: bool) {
+    /// Put an entry in the prompt. Ones that take an argument wait for it; the
+    /// rest complete (Tab) or run (Enter / palette).
+    fn run_cmd(&mut self, c: &Entry, run: bool) {
         if c.arg || !run {
             self.input = format!("{} ", c.name);
             if !c.arg {
@@ -619,7 +766,7 @@ impl App {
             }
             self.cursor = self.input.chars().count();
         } else {
-            self.input = c.name.to_string();
+            self.input = c.name.clone();
             self.submit();
         }
     }
@@ -645,10 +792,10 @@ impl App {
             }
             KeyCode::Enter => {
                 let sel = p.sel;
-                let cmd = self.palette_matches().get(sel).copied();
+                let cmd = self.palette_matches().get(sel).cloned();
                 self.palette = None;
                 if let Some(c) = cmd {
-                    self.run_cmd(c, true);
+                    self.run_cmd(&c, true);
                 }
             }
             _ => {}
@@ -709,12 +856,33 @@ impl App {
         let text = self.input.trim().to_string();
         self.input.clear();
         self.cursor = 0;
+        self.hist_pos = None;
         if text.is_empty() {
             return;
+        }
+        if self.history.last() != Some(&text) {
+            self.history.push(text.clone());
+            if self.history.len() > 200 {
+                self.history.remove(0);
+            }
+            if self.persist {
+                crate::config::save_history(&self.history);
+            }
         }
         match text.as_str() {
             "/help" => self.help = true,
             "/theme" => self.open_theme_picker(),
+            "/model" => self.open_model_panel(),
+            _ if text.starts_with("/model ") => {
+                let route = text["/model ".len()..].trim().to_string();
+                self.apply_model(&route);
+            }
+            "/resume" => self.open_resume_panel(),
+            "/skills" => self.open_skills_panel(),
+            "/mcp" => self.open_mcp_panel(),
+            "/context" => self.open_context_panel(),
+            "/import" => self.open_import_panel(),
+            "/export" => self.export_session(),
             _ if text.starts_with("/theme ") => {
                 let name = text["/theme ".len()..].trim();
                 if theme::set_by_name(name) {
@@ -726,10 +894,19 @@ impl App {
                 }
             }
             "/copy" => {
-                if let Some(code) = self.cur_snippets().last().map(|s| s.code.clone()) {
-                    self.copy(&code);
-                } else {
-                    self.flash("no snippet to copy yet".into());
+                let reply = self.cur_session.and_then(|si| {
+                    self.projects[self.cur_project].sessions[si]
+                        .items
+                        .iter()
+                        .rev()
+                        .find_map(|i| match i {
+                            Item::Assistant(t) => Some(t.clone()),
+                            _ => None,
+                        })
+                });
+                match reply {
+                    Some(t) => self.copy(&t),
+                    None => self.flash("no reply to copy yet".into()),
                 }
             }
             "/sidebar" => self.show_sidebar = !self.show_sidebar,
@@ -752,6 +929,7 @@ impl App {
                 }
             }
             _ => {
+                let text = self.expand_slash(text);
                 let p = self.cur_project;
                 let si = match self.cur_session {
                     Some(si) => si,
@@ -815,6 +993,10 @@ impl App {
             self.advisor_setup_key(k);
             return;
         }
+        if self.panel.is_some() {
+            self.panel_key(k);
+            return;
+        }
         if self.themes.is_some() {
             self.theme_key(k);
             return;
@@ -846,12 +1028,12 @@ impl App {
                     return;
                 }
                 KeyCode::Tab | KeyCode::Enter => {
-                    let c = popup[self.slash_sel.min(popup.len() - 1)];
+                    let c = popup[self.slash_sel.min(popup.len() - 1)].clone();
                     let exact = self.input.trim() == c.name;
                     if k.code == KeyCode::Enter && exact && !c.arg {
                         self.submit();
                     } else {
-                        self.run_cmd(c, k.code == KeyCode::Enter);
+                        self.run_cmd(&c, k.code == KeyCode::Enter);
                     }
                     return;
                 }
@@ -872,10 +1054,15 @@ impl App {
                 })
             }
             KeyCode::Char('t') if ctrl => self.open_theme_picker(),
-            KeyCode::Up if self.input.is_empty() => self.scroll(3),
-            KeyCode::Down if self.input.is_empty() => self.scroll(-3),
             KeyCode::Up if alt => self.step(-1),
             KeyCode::Down if alt => self.step(1),
+            KeyCode::Up if self.input.is_empty() || self.hist_pos.is_some() => self.recall(-1),
+            KeyCode::Down if self.hist_pos.is_some() => self.recall(1),
+            KeyCode::Esc if self.input.is_empty() => self.interrupt_current(),
+            KeyCode::Char('m') if alt => self.open_model_panel(),
+            KeyCode::Char('r') if alt => self.open_resume_panel(),
+            KeyCode::Left if ctrl => self.word_move(-1),
+            KeyCode::Right if ctrl => self.word_move(1),
             KeyCode::Char(c @ '1'..='9') if alt => {
                 let n = c as usize - '1' as usize;
                 if let Some(i) = (0..self.projects.len())
@@ -913,6 +1100,15 @@ impl App {
             KeyCode::PageDown => self.scroll(-(page as isize)),
             KeyCode::End if self.input.is_empty() => self.scroll(isize::MIN),
             KeyCode::Enter if alt => self.insert('\n'),
+            // Windows delivers a paste as key events: an Enter that follows a
+            // character within a few ms is part of the pasted text, not a submit.
+            KeyCode::Enter
+                if self
+                    .last_char
+                    .is_some_and(|t| t.elapsed() < Duration::from_millis(20)) =>
+            {
+                self.insert('\n')
+            }
             KeyCode::Enter => self.submit(),
             KeyCode::Backspace => {
                 if self.cursor > 0 {
@@ -931,7 +1127,10 @@ impl App {
             KeyCode::Right => self.cursor = (self.cursor + 1).min(self.input.chars().count()),
             KeyCode::Home => self.cursor = 0,
             KeyCode::End => self.cursor = self.input.chars().count(),
-            KeyCode::Char(c) if !ctrl && !alt => self.insert(c),
+            KeyCode::Char(c) if !ctrl && !alt => {
+                self.last_char = Some(Instant::now());
+                self.insert(c)
+            }
             _ => {}
         }
     }
@@ -987,6 +1186,13 @@ impl App {
 
     /// Expire the status flash; true when the screen needs a redraw.
     pub fn housekeeping(&mut self) -> bool {
+        if matches!(self.panel.as_ref().map(|p| p.kind), Some(Kind::Mcp)) {
+            let items = self.mcp_items();
+            if let Some(p) = self.panel.as_mut() {
+                p.refresh(items);
+            }
+            return true;
+        }
         if matches!(&self.flash, Some((_, at)) if at.elapsed() > Duration::from_secs(3)) {
             self.flash = None;
             return true;
@@ -1053,6 +1259,9 @@ impl App {
         let idx = self.projects.len();
         self.projects
             .push(Project::new(&name, &dir, &self.default_model));
+        if self.strict_paths {
+            self.projects[idx].load_conventions();
+        }
         self.backend.open(
             idx,
             &ProjectSpec {
@@ -1233,6 +1442,622 @@ impl App {
     }
 }
 
+impl App {
+    // ----- conventions ------------------------------------------------------------------
+
+    /// Load skills and custom commands for every workspace (real mode only).
+    pub fn load_conventions(&mut self) {
+        for p in self.projects.iter_mut() {
+            p.load_conventions();
+        }
+    }
+
+    /// `/skill args` becomes a prompt that points the model at the skill;
+    /// `/command args` expands the command file. Anything else passes through.
+    fn expand_slash(&mut self, text: String) -> String {
+        let Some(rest) = text.strip_prefix('/') else {
+            return text;
+        };
+        let (name, args) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+        let pr = &self.projects[self.cur_project];
+        if let Some(c) = pr.commands.iter().find(|c| c.name == name) {
+            return destro_core::skills::expand_command(c, args.trim());
+        }
+        if let Some(k) = pr.skills.iter().find(|k| k.name == name) {
+            let mut s = format!("Use the `{}` skill (load it with the skill tool).", k.name);
+            if !args.trim().is_empty() {
+                s.push_str(&format!(" Task: {}", args.trim()));
+            }
+            return s;
+        }
+        text
+    }
+
+    // ----- history and editing ----------------------------------------------------------
+
+    fn recall(&mut self, dir: isize) {
+        if self.history.is_empty() {
+            return;
+        }
+        let n = self.history.len();
+        let next = match (self.hist_pos, dir) {
+            (None, -1) => {
+                self.hist_draft = std::mem::take(&mut self.input);
+                Some(n - 1)
+            }
+            (Some(i), -1) => Some(i.saturating_sub(1)),
+            (Some(i), 1) if i + 1 < n => Some(i + 1),
+            (Some(_), 1) => None,
+            _ => return,
+        };
+        self.hist_pos = next;
+        self.input = match next {
+            Some(i) => self.history[i].clone(),
+            None => std::mem::take(&mut self.hist_draft),
+        };
+        self.cursor = self.input.chars().count();
+    }
+
+    fn word_move(&mut self, dir: isize) {
+        let chars: Vec<char> = self.input.chars().collect();
+        let mut i = self.cursor;
+        if dir < 0 {
+            while i > 0 && chars[i - 1].is_whitespace() {
+                i -= 1;
+            }
+            while i > 0 && !chars[i - 1].is_whitespace() {
+                i -= 1;
+            }
+        } else {
+            while i < chars.len() && chars[i].is_whitespace() {
+                i += 1;
+            }
+            while i < chars.len() && !chars[i].is_whitespace() {
+                i += 1;
+            }
+        }
+        self.cursor = i;
+    }
+
+    /// Bracketed paste (where the terminal sends it): insert verbatim.
+    pub fn on_paste(&mut self, text: &str) {
+        if self.panel.is_some() || self.setup.is_some() {
+            return;
+        }
+        for c in text.replace("\r\n", "\n").replace('\r', "\n").chars() {
+            self.insert(c);
+        }
+    }
+
+    /// Esc with an empty prompt stops the running turn of the current session.
+    fn interrupt_current(&mut self) {
+        let Some(si) = self.cur_session else { return };
+        let p = self.cur_project;
+        let s = &self.projects[p].sessions[si];
+        if s.status == Status::Running {
+            let id = s.id.clone();
+            self.backend.interrupt(p, &id);
+            self.flash("interrupting…".into());
+        }
+    }
+
+    // ----- panels -----------------------------------------------------------------------
+
+    fn short(path: &std::path::Path) -> String {
+        let s = path.to_string_lossy().to_string();
+        match destro_core::context::home_dir() {
+            Some(h) => {
+                let hs = h.to_string_lossy().to_string();
+                match s.strip_prefix(&hs) {
+                    Some(rest) => format!("~{rest}"),
+                    None => s,
+                }
+            }
+            None => s,
+        }
+    }
+
+    fn cur_session_id(&self) -> Option<String> {
+        self.cur_session
+            .map(|si| self.projects[self.cur_project].sessions[si].id.clone())
+    }
+
+    fn open_model_panel(&mut self) {
+        let cur = self.projects[self.cur_project].model.clone();
+        let mut routes: Vec<String> = self.model_suggestions.clone();
+        if !routes.contains(&cur) {
+            routes.insert(0, cur.clone());
+        }
+        let items = routes
+            .into_iter()
+            .map(|r| {
+                let it = panel::Item::new(r.clone(), r.clone());
+                if r == cur {
+                    it.tag("current", Tone::Good)
+                } else {
+                    it
+                }
+            })
+            .collect();
+        let mut p = Panel::new(Kind::Model, "MODEL", items);
+        p.footer = "type to filter or enter any provider/model · Enter switch · Esc close".into();
+        p.empty = "no match — press Enter to use what you typed".into();
+        if let Some(i) = p.items.iter().position(|i| i.id == cur) {
+            p.sel = i;
+        }
+        self.panel = Some(p);
+    }
+
+    fn apply_model(&mut self, route: &str) {
+        let route = route.trim();
+        if route.is_empty() {
+            return;
+        }
+        let p = self.cur_project;
+        let sid = self.cur_session_id();
+        self.backend.set_model(p, sid.as_deref(), route);
+        self.projects[p].model = route.to_string();
+        self.default_model = route.to_string();
+        self.flash(format!("model: {route}"));
+    }
+
+    fn open_skills_panel(&mut self) {
+        let pr = &self.projects[self.cur_project];
+        let mut items: Vec<panel::Item> = vec![];
+        for k in &pr.skills {
+            items.push(
+                panel::Item::new(format!("/{}", k.name), k.name.clone())
+                    .detail(k.description.clone())
+                    .tag(k.scope.as_str(), Tone::Muted),
+            );
+        }
+        for c in &pr.commands {
+            items.push(
+                panel::Item::new(format!("/{}", c.name), format!("/{}", c.name))
+                    .detail(c.description.clone())
+                    .tag("command", Tone::Good),
+            );
+        }
+        let mut p = Panel::new(Kind::Skills, "SKILLS & COMMANDS", items);
+        p.footer = "Enter put it in the prompt · the model can also load skills itself".into();
+        p.empty =
+            "none found — add SKILL.md folders under .claude/skills or ~/.destro/skills".into();
+        self.panel = Some(p);
+    }
+
+    fn mcp_items(&self) -> Vec<panel::Item> {
+        use destro_core::mcp::McpState;
+        self.backend
+            .mcp_status(self.cur_project)
+            .into_iter()
+            .map(|s| {
+                let (tag, tone, detail) = match &s.state {
+                    McpState::Ready => (
+                        "ready",
+                        Tone::Good,
+                        format!("{} tools · {}", s.tools.len(), s.detail),
+                    ),
+                    McpState::Connecting => ("connecting", Tone::Warn, s.detail.clone()),
+                    McpState::Pending => (
+                        "needs approval",
+                        Tone::Warn,
+                        format!(
+                            "from {} · Enter to trust and start · {}",
+                            Self::short(&s.source),
+                            s.detail
+                        ),
+                    ),
+                    McpState::Disabled => ("disabled", Tone::Muted, s.detail.clone()),
+                    McpState::Failed(e) => ("failed", Tone::Bad, e.clone()),
+                };
+                panel::Item::new(s.name.clone(), s.name.clone())
+                    .detail(detail)
+                    .tag(tag, tone)
+            })
+            .collect()
+    }
+
+    fn open_mcp_panel(&mut self) {
+        let items = self.mcp_items();
+        let mut p = Panel::new(Kind::Mcp, "MCP SERVERS", items);
+        p.filterable = false;
+        p.footer = "Enter approve / toggle · r reconnect · Esc close".into();
+        p.empty = "no servers — add .mcp.json to the project or ~/.destro/mcp.json".into();
+        self.panel = Some(p);
+    }
+
+    fn open_context_panel(&mut self) {
+        let cwd = std::path::PathBuf::from(&self.projects[self.cur_project].cwd);
+        let files = destro_core::context::load_instructions(&cwd);
+        let items = files
+            .iter()
+            .map(|f| {
+                let mut d = format!(
+                    "{} lines · {:.1} KB",
+                    f.text.lines().count(),
+                    f.bytes as f64 / 1024.0
+                );
+                if f.imports > 0 {
+                    d.push_str(&format!(
+                        " · {} import{}",
+                        f.imports,
+                        if f.imports == 1 { "" } else { "s" }
+                    ));
+                }
+                if f.truncated {
+                    d.push_str(" · truncated");
+                }
+                panel::Item::new(f.path.to_string_lossy(), Self::short(&f.path))
+                    .detail(d)
+                    .tag(
+                        f.scope.as_str(),
+                        if f.scope == destro_core::context::Scope::User {
+                            Tone::Muted
+                        } else {
+                            Tone::Good
+                        },
+                    )
+            })
+            .collect();
+        let mut p = Panel::new(Kind::Context, "CONTEXT FILES", items);
+        p.filterable = false;
+        p.footer = "all of these are in every agent's system prompt · Esc close".into();
+        p.empty = "no AGENTS.md or CLAUDE.md found — create AGENTS.md in your project".into();
+        self.panel = Some(p);
+    }
+
+    fn open_resume_panel(&mut self) {
+        let cwd = self.projects[self.cur_project].cwd.clone();
+        let open: std::collections::HashSet<String> = self.projects[self.cur_project]
+            .sessions
+            .iter()
+            .map(|s| s.id.clone())
+            .collect();
+        let items = destro_core::store::list(&cwd)
+            .into_iter()
+            .map(|m| {
+                let mut it =
+                    panel::Item::new(m.path.to_string_lossy(), m.title.clone()).detail(format!(
+                        "{} · {} turn{}{}",
+                        destro_core::context::date_from_ms(m.updated_ms.max(m.created_ms)),
+                        m.turns,
+                        if m.turns == 1 { "" } else { "s" },
+                        if m.model.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" · {}", m.model)
+                        },
+                    ));
+                if open.contains(&m.id) {
+                    it = it.tag("open", Tone::Good);
+                } else if m.origin == "dsh" {
+                    it = it.tag("dsh", Tone::Muted);
+                }
+                it
+            })
+            .collect();
+        let mut p = Panel::new(Kind::Resume, "RESUME A SESSION", items);
+        p.footer = "Enter continue it · type to filter · /import brings in dsh chats".into();
+        p.empty = "no saved sessions for this workspace yet".into();
+        self.panel = Some(p);
+    }
+
+    fn open_import_panel(&mut self) {
+        let Some(home) = destro_core::dsh::dsh_home() else {
+            self.flash("cannot locate the dsh home directory".into());
+            return;
+        };
+        self.dsh = destro_core::dsh::scan(&home);
+        let items = self.import_workspace_items();
+        let mut p = Panel::new(
+            Kind::ImportWorkspaces,
+            "IMPORT FROM DSH · WORKSPACES",
+            items,
+        );
+        p.footer = "Enter browse chats · i import every chat in the workspace · Esc close".into();
+        p.empty = format!("no dsh chats found under {}", Self::short(&home));
+        self.panel = Some(p);
+    }
+
+    fn import_workspace_items(&self) -> Vec<panel::Item> {
+        self.dsh
+            .iter()
+            .enumerate()
+            .map(|(i, w)| {
+                let bytes: u64 = w.sessions.iter().map(|s| s.bytes).sum();
+                let open = self.projects.iter().any(|p| !p.closed && p.cwd == w.path);
+                let it = panel::Item::new(i.to_string(), w.path.clone()).detail(format!(
+                    "{} chat{} · {:.1} MB",
+                    w.sessions.len(),
+                    if w.sessions.len() == 1 { "" } else { "s" },
+                    bytes as f64 / 1_048_576.0
+                ));
+                if open { it.tag("open", Tone::Good) } else { it }
+            })
+            .collect()
+    }
+
+    fn open_import_sessions(&mut self, ws: usize) {
+        let Some(w) = self.dsh.get(ws) else { return };
+        let dir = destro_core::store::sessions_dir(&w.path);
+        let items = w
+            .sessions
+            .iter()
+            .map(|s| {
+                let done = dir
+                    .as_ref()
+                    .is_some_and(|d| d.join(format!("dsh-{}.jsonl", s.id)).exists());
+                let title = if s.title.trim().is_empty() {
+                    "(untitled)".to_string()
+                } else {
+                    s.title.clone()
+                };
+                let it = panel::Item::new(s.id.clone(), title).detail(format!(
+                    "{} · {:.1} MB",
+                    destro_core::context::date_from_ms(s.created_ms),
+                    s.bytes as f64 / 1_048_576.0
+                ));
+                if done {
+                    it.tag("imported", Tone::Good)
+                } else {
+                    it
+                }
+            })
+            .collect();
+        let mut p = Panel::new(
+            Kind::ImportSessions(ws),
+            &format!("IMPORT · {}", Self::short(std::path::Path::new(&w.path))),
+            items,
+        );
+        p.multi = true;
+        p.footer = "Space tick · Ctrl+A all · Enter import ticked (or this one) · Esc back".into();
+        p.empty = "no chats".into();
+        self.panel = Some(p);
+    }
+
+    /// Convert dsh sessions in the background; reports through `Msg::Imported`.
+    fn run_import(&mut self, ws: usize, ids: Vec<String>) {
+        let Some(w) = self.dsh.get(ws) else { return };
+        let cwd = w.path.clone();
+        let chosen: Vec<_> = w
+            .sessions
+            .iter()
+            .filter(|s| ids.contains(&s.id))
+            .cloned()
+            .collect();
+        if chosen.is_empty() {
+            return;
+        }
+        self.flash(format!(
+            "importing {} chat{}…",
+            chosen.len(),
+            if chosen.len() == 1 { "" } else { "s" }
+        ));
+        let tx = self.tx.clone();
+        let work = move || {
+            let (mut new, mut skipped, mut failed) = (0, 0, 0);
+            for s in &chosen {
+                match destro_core::dsh::import_session(s, &cwd, false) {
+                    Ok(destro_core::dsh::Imported::New) => new += 1,
+                    Ok(destro_core::dsh::Imported::AlreadyThere) => skipped += 1,
+                    Err(_) => failed += 1,
+                }
+            }
+            if let Some(tx) = tx {
+                let _ = tx.send(Msg::Imported {
+                    cwd,
+                    new,
+                    skipped,
+                    failed,
+                });
+            }
+        };
+        std::thread::spawn(work);
+    }
+
+    fn panel_key(&mut self, k: KeyEvent) {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let Some(p) = self.panel.as_mut() else { return };
+        let kind = p.kind;
+        match k.code {
+            KeyCode::Esc => {
+                let back = matches!(kind, Kind::ImportSessions(_));
+                self.panel = None;
+                if back {
+                    self.panel = {
+                        let items = self.import_workspace_items();
+                        let mut pn = Panel::new(
+                            Kind::ImportWorkspaces,
+                            "IMPORT FROM DSH · WORKSPACES",
+                            items,
+                        );
+                        pn.footer =
+                            "Enter browse chats · i import every chat in the workspace · Esc close"
+                                .into();
+                        Some(pn)
+                    };
+                }
+            }
+            KeyCode::Up => p.step(-1),
+            KeyCode::Down => p.step(1),
+            KeyCode::PageUp => p.step(-8),
+            KeyCode::PageDown => p.step(8),
+            KeyCode::Home => p.sel = 0,
+            KeyCode::End => p.sel = p.visible().len().saturating_sub(1),
+            KeyCode::Char('a') if ctrl && p.multi => p.mark_all(),
+            KeyCode::Char(' ') if p.multi => p.toggle_mark(),
+            KeyCode::Char('r') if kind == Kind::Mcp => {
+                if let Some(id) = p.current().map(|i| i.id.clone()) {
+                    self.backend.mcp_do(self.cur_project, &id, "reconnect");
+                }
+            }
+            KeyCode::Char('i') if kind == Kind::ImportWorkspaces => {
+                if let Some(ws) = p.current().and_then(|i| i.id.parse::<usize>().ok()) {
+                    let ids: Vec<String> =
+                        self.dsh[ws].sessions.iter().map(|s| s.id.clone()).collect();
+                    self.panel = None;
+                    self.run_import(ws, ids);
+                }
+            }
+            KeyCode::Backspace if p.filterable => {
+                p.query.pop();
+                p.sel = 0;
+            }
+            KeyCode::Char(c) if p.filterable && !ctrl => {
+                p.query.push(c);
+                p.sel = 0;
+            }
+            KeyCode::Enter => self.panel_enter(),
+            _ => {}
+        }
+    }
+
+    fn panel_enter(&mut self) {
+        let Some(p) = self.panel.as_ref() else { return };
+        let kind = p.kind;
+        let cur = p.current().map(|i| i.id.clone());
+        let query = p.query.trim().to_string();
+        let marks: Vec<String> = p.marks.iter().cloned().collect();
+        match kind {
+            Kind::Model => {
+                let route = cur.unwrap_or(query);
+                self.panel = None;
+                self.apply_model(&route);
+            }
+            Kind::Skills => {
+                self.panel = None;
+                if let Some(name) = cur {
+                    self.input = format!("{name} ");
+                    self.cursor = self.input.chars().count();
+                }
+            }
+            Kind::Mcp => {
+                let Some(name) = cur else { return };
+                let state = self
+                    .backend
+                    .mcp_status(self.cur_project)
+                    .into_iter()
+                    .find(|s| s.name == name)
+                    .map(|s| s.state);
+                use destro_core::mcp::McpState;
+                let action = match state {
+                    Some(McpState::Pending) => "approve",
+                    Some(McpState::Disabled) => "enable",
+                    Some(McpState::Ready) => "disable",
+                    _ => "reconnect",
+                };
+                self.backend.mcp_do(self.cur_project, &name, action);
+            }
+            Kind::Context => {}
+            Kind::Resume => {
+                self.panel = None;
+                if let Some(path) = cur {
+                    self.resume_session(&path);
+                }
+            }
+            Kind::ImportWorkspaces => {
+                if let Some(ws) = cur.and_then(|i| i.parse::<usize>().ok()) {
+                    self.open_import_sessions(ws);
+                }
+            }
+            Kind::ImportSessions(ws) => {
+                let ids = if marks.is_empty() {
+                    cur.into_iter().collect()
+                } else {
+                    marks
+                };
+                self.panel = None;
+                self.run_import(ws, ids);
+            }
+        }
+    }
+
+    /// Open a stored session: replay its events into a transcript and hand the
+    /// reconstructed conversation to the backend so the agent can continue.
+    pub fn resume_session(&mut self, path: &str) {
+        let path = std::path::Path::new(path);
+        let Some(meta) = destro_core::store::read_meta(path) else {
+            self.flash("could not read that session".into());
+            return;
+        };
+        let p = self.cur_project;
+        if let Some(&si) = self.projects[p].index.get(&meta.id) {
+            self.select(Row::Session(p, si, 0));
+            return;
+        }
+        let events = destro_core::store::load(path);
+        let si = self.projects[p].session_mut(&meta.id);
+        {
+            let s = &mut self.projects[p].sessions[si];
+            for ev in &events {
+                s.apply_event(ev);
+            }
+            s.unread = false;
+            s.status = Status::Idle;
+        }
+        let history = destro_core::store::replay_messages(&events);
+        self.backend.restore(p, &meta.id, history, &meta.model);
+        self.cur_session = Some(si);
+        self.flash(format!("resumed: {}", meta.title));
+    }
+
+    fn export_session(&mut self) {
+        let Some(si) = self.cur_session else {
+            self.flash("nothing to export — no session selected".into());
+            return;
+        };
+        let pr = &self.projects[self.cur_project];
+        let s = &pr.sessions[si];
+        let mut md = format!("# {}\n\n", s.label());
+        for it in &s.items {
+            match it {
+                Item::User(t) => md.push_str(&format!("## You\n\n{t}\n\n")),
+                Item::Assistant(t) => md.push_str(&format!("{t}\n\n")),
+                Item::ToolCall { name, args } => {
+                    md.push_str(&format!("> tool `{name}` {args}\n\n"))
+                }
+                Item::ToolResult { text, is_error, .. } => md.push_str(&format!(
+                    "```{}\n{}\n```\n\n",
+                    if *is_error { "error" } else { "" },
+                    text
+                )),
+                Item::Notice(t) => md.push_str(&format!("_{t}_\n\n")),
+                Item::Reasoning(_) => {}
+            }
+        }
+        let slug: String = s
+            .label()
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_lowercase()
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>()
+            .split('-')
+            .filter(|p| !p.is_empty())
+            .take(6)
+            .collect::<Vec<_>>()
+            .join("-");
+        let dir = std::path::PathBuf::from(&pr.cwd);
+        let dir = if dir.is_dir() {
+            dir
+        } else {
+            std::env::current_dir().unwrap_or_default()
+        };
+        let file = dir.join(format!(
+            "destro-{}.md",
+            if slug.is_empty() { "session" } else { &slug }
+        ));
+        match std::fs::write(&file, md) {
+            Ok(()) => self.flash(format!("saved {}", Self::short(&file))),
+            Err(e) => self.flash(format!("export failed: {e}")),
+        }
+    }
+}
+
 fn base64(data: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
@@ -1254,6 +2079,142 @@ fn base64(data: &[u8]) -> String {
         });
     }
     out
+}
+
+#[cfg(test)]
+mod flow_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    type Restored = Vec<(String, Vec<Value>, String)>;
+    type Models = Vec<(Option<String>, String)>;
+
+    #[derive(Default, Clone)]
+    struct Rec {
+        restored: Arc<Mutex<Restored>>,
+        models: Arc<Mutex<Models>>,
+    }
+
+    impl Backend for Rec {
+        fn send(&self, _: usize, _: Value) {}
+        fn kill(&self, _: usize) {}
+        fn open(&self, _: usize, _: &ProjectSpec) {}
+        fn restore(&self, _: usize, session: &str, history: Vec<Value>, model: &str) {
+            self.restored
+                .lock()
+                .unwrap()
+                .push((session.into(), history, model.into()));
+        }
+        fn set_model(&self, _: usize, session: Option<&str>, model: &str) {
+            self.models
+                .lock()
+                .unwrap()
+                .push((session.map(str::to_string), model.into()));
+        }
+    }
+
+    fn app(rec: &Rec) -> App {
+        App::new(
+            vec![Project::new("p", "/tmp/p", "deepseek-v4-pro")],
+            Box::new(rec.clone()),
+        )
+    }
+
+    fn key(c: KeyCode) -> KeyEvent {
+        KeyEvent::new(c, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn resume_replays_transcript_and_restores_the_conversation() {
+        let dir = std::env::temp_dir().join(format!("destro-resume-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.jsonl");
+        let mut w =
+            destro_core::store::SessionWriter::open_at(&path, "/tmp/p", "tui-1", "m1", "destro")
+                .unwrap();
+        for ev in [
+            json!({"type":"user/message","data":{"content":[{"type":"text","text":"hello"}],"source":{"kind":"user"}}}),
+            json!({"type":"assistant/message","data":{"message":{"content":[{"type":"text","text":"hi there"}]}}}),
+        ] {
+            w.append(&ev);
+        }
+        let rec = Rec::default();
+        let mut a = app(&rec);
+        a.resume_session(&path.to_string_lossy());
+        let s = &a.projects[0].sessions[a.cur_session.unwrap()];
+        assert_eq!(s.id, "tui-1");
+        assert!(matches!(&s.items[0], Item::User(t) if t == "hello"));
+        assert!(matches!(&s.items[1], Item::Assistant(t) if t == "hi there"));
+        let got = rec.restored.lock().unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].1.len(), 2);
+        assert_eq!(got[0].1[1]["content"], "hi there");
+        assert_eq!(got[0].2, "m1");
+        // resuming again just selects the open session
+        drop(got);
+        a.cur_session = None;
+        a.resume_session(&path.to_string_lossy());
+        assert_eq!(rec.restored.lock().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn model_command_switches_route_and_remembers_it() {
+        let rec = Rec::default();
+        let mut a = app(&rec);
+        a.input = "/model deepseek/deepseek-v4-flash".into();
+        a.submit();
+        assert_eq!(a.projects[0].model, "deepseek/deepseek-v4-flash");
+        assert_eq!(
+            rec.models.lock().unwrap()[0],
+            (None, "deepseek/deepseek-v4-flash".to_string())
+        );
+    }
+
+    #[test]
+    fn model_panel_enter_with_typed_route_uses_it() {
+        let rec = Rec::default();
+        let mut a = app(&rec);
+        a.input = "/model".into();
+        a.submit();
+        assert!(a.panel.is_some());
+        for c in "zz/custom".chars() {
+            a.on_key(key(KeyCode::Char(c)));
+        }
+        a.on_key(key(KeyCode::Enter));
+        assert!(a.panel.is_none());
+        assert_eq!(a.projects[0].model, "zz/custom");
+    }
+
+    #[test]
+    fn slash_popup_lists_skills_and_history_recalls() {
+        let rec = Rec::default();
+        let mut a = app(&rec);
+        a.projects[0]
+            .commands
+            .push(destro_core::skills::CustomCommand {
+                name: "deploy".into(),
+                description: "ship it".into(),
+                path: "x.md".into(),
+                scope: destro_core::context::Scope::Project,
+                body: "Deploy $ARGUMENTS".into(),
+            });
+        a.input = "/dep".into();
+        let m = a.slash_matches();
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].name, "/deploy");
+        assert_eq!(a.expand_slash("/deploy prod".into()), "Deploy prod");
+        a.history = vec!["first".into(), "second".into()];
+        a.input.clear();
+        a.on_key(key(KeyCode::Up));
+        assert_eq!(a.input, "second");
+        a.on_key(key(KeyCode::Up));
+        assert_eq!(a.input, "first");
+        a.on_key(key(KeyCode::Down));
+        a.on_key(key(KeyCode::Down));
+        assert_eq!(a.input, "");
+    }
 }
 
 #[cfg(test)]

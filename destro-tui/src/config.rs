@@ -60,3 +60,23 @@ pub fn save_theme(name: &str) {
         let _ = std::fs::write(p, text);
     }
 }
+
+// ----- prompt history ------------------------------------------------------------------------
+
+fn history_file() -> Option<PathBuf> {
+    file().map(|p| p.with_file_name("history.json"))
+}
+
+pub fn load_history() -> Vec<String> {
+    history_file()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_history(h: &[String]) {
+    let Some(p) = history_file() else { return };
+    if let Ok(t) = serde_json::to_string(h) {
+        let _ = std::fs::write(p, t);
+    }
+}

@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*", "destro-tui"]
 
 [workspace.package]
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 
@@ -23,3 +23,7 @@ ignore = "0.4.32"
 globset = "0.4.19"
 unicode-width = "0.2.3"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "http2", "stream", "json"] }
+
+# the dsh importer decodes tens of MB of zstd; keep dev builds usable
+[profile.dev.package.ruzstd]
+opt-level = 3

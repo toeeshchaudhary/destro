@@ -20,3 +20,4 @@ parking_lot.workspace = true
 reqwest.workspace = true
 destro-proto = { path = "../destro-proto" }
 destro-tools = { path = "../destro-tools" }
+ruzstd = "0.9.1"

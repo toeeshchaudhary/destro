@@ -8,11 +8,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, Cmd, Mode, Row};
+use crate::app::{App, Entry, EntryKind, Mode, Row};
 use crate::balance::Balance;
 use crate::highlight::{self, Highlighter, expand_tabs};
 use crate::md;
 use crate::model::{Conn, Item, Project, Session, Status, truncate};
+use crate::panel::Tone;
 use crate::theme::{self, THEMES};
 
 const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -314,6 +315,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.palette.is_some() {
         draw_palette(f, app, area);
     }
+    if app.panel.is_some() {
+        draw_panel(f, app, area);
+    }
     if app.themes.is_some() {
         draw_theme_picker(f, app, area);
     }
@@ -490,7 +494,15 @@ fn draw_main(f: &mut Frame, app: &mut App, area: Rect) {
         if se.status == Status::Running {
             head.push(Span::raw("  "));
             head.push(status_glyph(se.status, app.tick));
-            head.push(Span::styled(" working", theme::accent()));
+            let secs = se.started.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+            head.push(Span::styled(
+                if secs >= 2 {
+                    format!(" working {secs}s")
+                } else {
+                    " working".to_string()
+                },
+                theme::accent(),
+            ));
         }
         if se.scroll > 0 {
             head.push(Span::styled(
@@ -643,11 +655,15 @@ fn draw_main(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         let mut budget = (area.width as usize).saturating_sub(tag_w + 3);
         let hints: [(&str, &str); 6] = [
-            ("Enter", "send"),
+            if running {
+                ("Esc", "interrupt")
+            } else {
+                ("Enter", "send")
+            },
             ("Alt+Enter", "newline"),
-            ("Alt+↑↓", "switch"),
+            ("Alt+M", "model"),
             ("Ctrl+P", "commands"),
-            ("Ctrl+T", "themes"),
+            ("Alt+↑↓", "switch"),
             ("F1", "help"),
         ];
         for (kk, l) in hints {
@@ -679,7 +695,7 @@ fn draw_main(f: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-fn draw_slash_popup(f: &mut Frame, app: &App, matches: &[&'static Cmd], input: Rect, area: Rect) {
+fn draw_slash_popup(f: &mut Frame, app: &App, matches: &[Entry], input: Rect, area: Rect) {
     let n = matches.len().min(8) as u16;
     let w = 64.min(area.width.saturating_sub(2)).max(24);
     let h = n + 2;
@@ -712,20 +728,20 @@ fn draw_slash_popup(f: &mut Frame, app: &App, matches: &[&'static Cmd], input: R
 }
 
 /// One command row: name, description, shortcut right-aligned.
-fn cmd_line(c: &Cmd, w: usize, selected: bool) -> Line<'static> {
+fn cmd_line(c: &Entry, w: usize, selected: bool) -> Line<'static> {
     let bg = if selected {
         theme::sel()
     } else {
         Style::default()
     };
-    let name = format!(" {:<10}", c.name);
+    let name = format!(" {:<11}", c.name);
     let keys = if c.keys.is_empty() {
         String::new()
     } else {
         format!(" {} ", c.keys)
     };
     let room = w.saturating_sub(name.width() + keys.width() + 2);
-    let desc = truncate(c.desc, room);
+    let desc = truncate(&c.desc, room);
     let gap = w.saturating_sub(name.width() + desc.width() + keys.width());
     Line::from(vec![
         Span::styled(
@@ -747,11 +763,14 @@ fn cmd_line(c: &Cmd, w: usize, selected: bool) -> Line<'static> {
         Span::raw(" ".repeat(gap)),
         Span::styled(
             keys,
-            theme::faint().patch(if selected {
-                theme::muted()
-            } else {
-                Style::default()
-            }),
+            match c.kind {
+                EntryKind::Builtin => theme::faint().patch(if selected {
+                    theme::muted()
+                } else {
+                    Style::default()
+                }),
+                _ => theme::accent2(),
+            },
         ),
     ])
     .style(bg)
@@ -794,13 +813,18 @@ fn draw_welcome(f: &mut Frame, app: &App, area: Rect) {
     let mut sec = section("GET STARTED", lw);
     sec.spans.insert(0, Span::raw(pad.clone()));
     l.push(sec);
-    let tips: [(&str, &str); 6] = [
+    let tips: [(&str, &str); 8] = [
         ("Enter", "type a prompt and send it to the agent"),
-        ("/", "slash commands — Tab completes"),
+        ("/", "slash commands, skills and your own commands"),
         ("Ctrl+P", "command palette: search everything"),
-        ("Ctrl+T", "pick a colour theme (live preview)"),
+        ("Alt+M", "switch model or provider"),
+        (
+            "Alt+R",
+            "resume a saved session · /import brings in dsh chats",
+        ),
+        ("Ctrl+T", "pick a colour theme (22 of them)"),
         ("Alt+A", "advisor mode: planner + parallel workers"),
-        ("Alt+O", "open another workspace folder"),
+        ("Esc", "stop a running turn"),
     ];
     for (key, desc) in tips {
         l.push(Line::from(vec![
@@ -1131,7 +1155,7 @@ fn draw_approval(f: &mut Frame, app: &App, (p, a): (usize, usize), area: Rect) {
 
 fn draw_help(f: &mut Frame, area: Rect) {
     let wide = area.width >= 104;
-    let (w, h) = if wide { (100, 22) } else { (66, 40) };
+    let (w, h) = if wide { (100, 26) } else { (66, 48) };
     let inner = modal(
         f,
         area,
@@ -1157,8 +1181,10 @@ fn draw_help(f: &mut Frame, area: Rect) {
         key("Alt+↑ / Alt+↓", "previous / next workspace or session"),
         key("Alt+1 … Alt+9", "jump to workspace"),
         key("Alt+N", "new session in this workspace"),
+        key("Alt+R  /resume", "continue a saved session"),
         key("PgUp / PgDn", "scroll the transcript"),
-        key("↑ / ↓", "scroll too (when the prompt is empty)"),
+        key("↑ / ↓", "recall earlier prompts"),
+        key("Esc", "stop the running turn"),
         key("End", "jump to the newest message"),
         Line::raw(""),
         sec("PROMPT", half),
@@ -1171,6 +1197,11 @@ fn draw_help(f: &mut Frame, area: Rect) {
         sec("WORKSPACE", half),
         key("Ctrl+P", "command palette — search everything"),
         key("Ctrl+T", "colour themes with live preview"),
+        key("Alt+M  /model", "switch model / provider"),
+        key("/skills  /mcp", "skills, commands, MCP servers"),
+        key("/context", "AGENTS.md / CLAUDE.md in use"),
+        key("/import", "bring in DeepSeek Harness chats"),
+        key("/export", "save this session as Markdown"),
         key("Alt+O  /open", "add a workspace (Tab completes dirs)"),
         key("/close", "close the workspace"),
         key("Alt+A  /advisor", "planner + workers · /normal leaves"),
@@ -1257,12 +1288,17 @@ fn draw_theme_picker(f: &mut Frame, app: &App, area: Rect) {
         f,
         area,
         50,
-        THEMES.len() as u16 + 6,
+        (THEMES.len() as u16)
+            .min(area.height.saturating_sub(8))
+            .max(4)
+            + 6,
         chip_title("THEMES", theme::cur().accent),
         theme::accent(),
     );
     let mut l: Vec<Line> = vec![Line::raw("")];
-    for (i, t) in THEMES.iter().enumerate() {
+    let room = inner.height.saturating_sub(4).max(1) as usize;
+    let start = tp.sel.saturating_sub(room - 1);
+    for (i, t) in THEMES.iter().enumerate().skip(start).take(room) {
         let sel = i == tp.sel;
         let bg = if sel { theme::sel() } else { Style::default() };
         let sw = |c: Color| Span::styled("██", Style::new().fg(c));
@@ -1519,4 +1555,103 @@ fn draw_snippets(f: &mut Frame, app: &mut App, area: Rect) {
         Paragraph::new(Line::from(hl_line)).alignment(Alignment::Left),
         rows[1],
     );
+}
+
+fn tone_style(t: Tone) -> Style {
+    match t {
+        Tone::Normal => theme::text(),
+        Tone::Good => theme::ok(),
+        Tone::Warn => theme::warn(),
+        Tone::Bad => theme::err(),
+        Tone::Muted => theme::muted(),
+    }
+}
+
+/// The shared searchable list overlay (model, skills, MCP, resume, import…).
+fn draw_panel(f: &mut Frame, app: &App, area: Rect) {
+    let Some(p) = &app.panel else { return };
+    let vis = p.visible();
+    let shown = vis
+        .len()
+        .clamp(1, (area.height.saturating_sub(12) as usize).clamp(3, 14));
+    let extra = if p.filterable { 3 } else { 1 };
+    let w = 100.min(area.width.saturating_sub(4)).max(40);
+    let inner = modal(
+        f,
+        area,
+        w,
+        shown as u16 + extra + 4,
+        chip_title(&p.title, theme::cur().accent),
+        theme::accent(),
+    );
+    let iw = inner.width as usize;
+    let mut l: Vec<Line> = vec![Line::raw("")];
+    if p.filterable {
+        l.push(Line::from(vec![
+            Span::styled(" › ", theme::accent_b()),
+            Span::styled(p.query.clone(), theme::bold()),
+            Span::styled("▏", theme::accent_b()),
+        ]));
+        l.push(section("", iw));
+    }
+    if vis.is_empty() {
+        l.push(Line::styled(format!(" {}", p.empty), theme::muted()));
+    }
+    let sel = p.sel.min(vis.len().saturating_sub(1));
+    let start = sel.saturating_sub(shown - 1);
+    for (pos, &i) in vis.iter().enumerate().skip(start).take(shown) {
+        let it = &p.items[i];
+        let on = pos == sel;
+        let ticked = p.marks.contains(&it.id);
+        let lead = if p.multi {
+            if ticked { " ◉ " } else { " ○ " }
+        } else if on {
+            " ▸ "
+        } else {
+            "   "
+        };
+        let tag = if it.tag.is_empty() {
+            String::new()
+        } else {
+            format!(" {} ", it.tag)
+        };
+        let label_w = (iw / 2).saturating_sub(3).max(12);
+        let label = truncate(&it.label, label_w);
+        let detail_room = iw.saturating_sub(lead.width() + label_w + 2 + tag.width() + 1);
+        let detail = truncate(&it.detail, detail_room);
+        let gap = iw.saturating_sub(lead.width() + label_w + 2 + detail.width() + tag.width());
+        l.push(
+            Line::from(vec![
+                Span::styled(
+                    lead,
+                    if ticked {
+                        theme::ok()
+                    } else {
+                        theme::accent_b()
+                    },
+                ),
+                Span::styled(
+                    format!("{label:<label_w$}  "),
+                    if on { theme::bold() } else { theme::text() },
+                ),
+                Span::styled(detail, theme::muted()),
+                Span::raw(" ".repeat(gap)),
+                Span::styled(tag, tone_style(it.tone)),
+            ])
+            .style(if on { theme::sel() } else { Style::default() }),
+        );
+    }
+    if vis.len() > shown {
+        l.push(Line::styled(
+            format!(" {} of {}", sel + 1, vis.len()),
+            theme::faint(),
+        ));
+    } else {
+        l.push(Line::raw(""));
+    }
+    l.push(Line::from(vec![
+        Span::raw(" "),
+        Span::styled(truncate(&p.footer, iw.saturating_sub(2)), theme::muted()),
+    ]));
+    f.render_widget(Paragraph::new(l), inner);
 }

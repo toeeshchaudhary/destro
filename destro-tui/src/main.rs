@@ -7,6 +7,7 @@ mod highlight;
 mod local;
 mod md;
 mod model;
+mod panel;
 mod theme;
 mod ui;
 mod updater;
@@ -53,6 +54,8 @@ OPTIONS
   --slave-model <id>    worker model, skips its picker field
   --update          same as `update`
   --providers       same as `providers`
+  import-dsh [--list] [--force] [--dsh-home <dir>]
+                    import every DeepSeek Harness chat (see /import in the TUI)
   --theme <name>    colour theme (else the saved choice; Ctrl+T in the TUI)
   --version         print the version and exit
 ENV
@@ -76,6 +79,10 @@ struct Args {
     providers: bool,
     theme: Option<String>,
     prompt: Option<String>,
+    import_dsh: bool,
+    list: bool,
+    force: bool,
+    dsh_home: Option<String>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -96,6 +103,10 @@ fn parse_args() -> Result<Args> {
         providers: false,
         theme: None,
         prompt: None,
+        import_dsh: false,
+        list: false,
+        force: false,
+        dsh_home: None,
     };
     let mut it = std::env::args().skip(1).peekable();
     while let Some(x) = it.next() {
@@ -113,11 +124,15 @@ fn parse_args() -> Result<Args> {
             "--provider" => a.provider = it.next().unwrap_or_default(),
             "--model" => a.model = it.next().unwrap_or_default(),
             "--theme" => a.theme = it.next(),
+            "import-dsh" | "--import-dsh" => a.import_dsh = true,
+            "--list" => a.list = true,
+            "--force" => a.force = true,
+            "--dsh-home" => a.dsh_home = it.next(),
             "--snapshot" => {
                 let mode = match it.peek().map(String::as_str) {
                     Some(
                         "done" | "snippets" | "open" | "palette" | "themes" | "help" | "slash"
-                        | "fresh",
+                        | "fresh" | "model" | "context",
                     ) => it.next().unwrap(),
                     _ => String::new(),
                 };
@@ -233,6 +248,23 @@ fn snapshot(mode: &str) -> Result<()> {
         }
         "help" => app.help = true,
         "slash" => app.input = "/th".into(),
+        "model" => {
+            app.model_suggestions = vec![
+                "deepseek/deepseek-v4-pro".into(),
+                "deepseek/deepseek-v4-flash".into(),
+                "refuseless/deepseek-v4.1-flash-abliterated".into(),
+            ];
+            app.input = "/model".into();
+            app.on_key(ratatui::crossterm::event::KeyEvent::from(
+                ratatui::crossterm::event::KeyCode::Enter,
+            ));
+        }
+        "context" => {
+            app.input = "/context".into();
+            app.on_key(ratatui::crossterm::event::KeyEvent::from(
+                ratatui::crossterm::event::KeyCode::Enter,
+            ));
+        }
         "fresh" => app.cur_session = None,
         _ => {}
     }
@@ -358,7 +390,7 @@ fn probe(args: &Args) -> Result<()> {
     let registry = destro_core::ProviderRegistry::load();
     let providers = provider_set(&registry, &args.provider)?;
     let (tx, rx) = mpsc::channel();
-    let (projects, local) = Local::start(&specs, &args.model, providers, tx);
+    let (projects, local) = Local::start(&specs, &args.model, providers, tx, false);
     let mut app = App::new(projects, Box::new(local));
     if let (Some(a), Some(b)) = (&args.advisor_model, &args.slave_model) {
         app.arm_advisor(a, b);
@@ -411,6 +443,55 @@ fn probe(args: &Args) -> Result<()> {
     }
     if !replied {
         anyhow::bail!("in-process harness produced no assistant transcript within 20s");
+    }
+    Ok(())
+}
+
+/// `destro import-dsh`: convert every dsh root chat into a Destro session.
+fn run_import_dsh(args: &Args) -> Result<()> {
+    let home = match &args.dsh_home {
+        Some(h) => std::path::PathBuf::from(h),
+        None => destro_core::dsh::dsh_home()
+            .ok_or_else(|| anyhow::anyhow!("cannot locate the dsh home; pass --dsh-home"))?,
+    };
+    let spaces = destro_core::dsh::scan(&home);
+    if spaces.is_empty() {
+        println!("no dsh chats found under {}", home.display());
+        return Ok(());
+    }
+    let (mut new, mut skipped, mut failed) = (0, 0, 0);
+    for w in &spaces {
+        if args.list {
+            println!("{}  ({} chats)", w.path, w.sessions.len());
+            for s in &w.sessions {
+                println!(
+                    "  {}  {:>7.1} MB  {}",
+                    destro_core::context::date_from_ms(s.created_ms),
+                    s.bytes as f64 / 1_048_576.0,
+                    s.title
+                );
+            }
+            continue;
+        }
+        let (mut n, mut k, mut f) = (0, 0, 0);
+        for s in &w.sessions {
+            match destro_core::dsh::import_session(s, &w.path, args.force) {
+                Ok(destro_core::dsh::Imported::New) => n += 1,
+                Ok(destro_core::dsh::Imported::AlreadyThere) => k += 1,
+                Err(e) => {
+                    f += 1;
+                    eprintln!("  {}: {e}", s.id);
+                }
+            }
+        }
+        println!("{}: {n} imported, {k} already there, {f} failed", w.path);
+        new += n;
+        skipped += k;
+        failed += f;
+    }
+    if !args.list {
+        println!("\ndone: {new} imported, {skipped} already there, {failed} failed");
+        println!("open a workspace in destro and use /resume to continue a chat");
     }
     Ok(())
 }
@@ -477,6 +558,9 @@ fn main() -> Result<()> {
     if let Some(n) = args.bench {
         return bench(n, args.hold);
     }
+    if args.import_dsh {
+        return run_import_dsh(&args);
+    }
     if args.update {
         return run_update();
     }
@@ -488,6 +572,7 @@ fn main() -> Result<()> {
     }
 
     let (tx, rx) = mpsc::channel::<Msg>();
+    let ui_tx = tx.clone();
     let demo_mode = args.demo;
     let local_mode = !demo_mode && args.dsh.is_empty();
     let mut suggestions: Vec<String> = Vec::new();
@@ -545,7 +630,7 @@ fn main() -> Result<()> {
                     suggestions.push(format!("{}/{}", info.id, model));
                 }
             }
-            let (ps, local) = Local::start(&specs, &args.model, providers, tx.clone());
+            let (ps, local) = Local::start(&specs, &args.model, providers, tx.clone(), true);
             (
                 ps,
                 Box::new(local) as Box<dyn Backend>,
@@ -573,10 +658,15 @@ fn main() -> Result<()> {
     let mut app = App::new(projects, backend);
     app.balance = balance;
     app.default_model = args.model.clone();
+    app.tx = Some(ui_tx);
     app.strict_paths = !demo_mode;
     app.persist = !demo_mode;
     if !suggestions.is_empty() {
         app.model_suggestions = suggestions;
+    }
+    if !demo_mode {
+        app.load_conventions();
+        app.history = config::load_history();
     }
     if local_mode {
         app.flash(format!("rust harness · provider {provider_label}"));
@@ -587,7 +677,16 @@ fn main() -> Result<()> {
         _ => {}
     }
     let mut terminal = ratatui::init();
+    let _ = ratatui::crossterm::execute!(
+        std::io::stdout(),
+        ratatui::crossterm::event::EnableBracketedPaste,
+        ratatui::crossterm::terminal::SetTitle("destro")
+    );
     let res = run(&mut terminal, &mut app, rx);
+    let _ = ratatui::crossterm::execute!(
+        std::io::stdout(),
+        ratatui::crossterm::event::DisableBracketedPaste
+    );
     ratatui::restore();
     res
 }
@@ -621,6 +720,7 @@ fn run(
         if event::poll(Duration::from_millis(50))? {
             match event::read()? {
                 Event::Key(k) if k.kind != KeyEventKind::Release => app.on_key(k),
+                Event::Paste(text) => app.on_paste(&text),
                 Event::Resize(..) => {}
                 _ => continue,
             }

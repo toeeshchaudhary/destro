@@ -398,6 +398,8 @@ pub(crate) struct AgentInit {
     pub max_tokens: Option<u64>,
     pub max_steps: u32,
     pub priority: Priority,
+    pub history: Vec<Value>,
+    pub providers: Option<Arc<crate::harness::ProviderSet>>,
 }
 
 pub(crate) struct AgentTask {
@@ -417,6 +419,7 @@ pub(crate) struct AgentTask {
     cancel: CancellationToken,
     messages: Vec<Value>,
     turn: u32,
+    providers: Option<Arc<crate::harness::ProviderSet>>,
 }
 
 struct TurnOutcome {
@@ -441,8 +444,9 @@ impl AgentTask {
             max_steps: init.max_steps,
             priority: init.priority,
             cancel,
-            messages: Vec::new(),
+            messages: init.history,
             turn: 0,
+            providers: init.providers,
         }
     }
 
@@ -617,7 +621,17 @@ impl AgentTask {
             .push(json!({ "role": "user", "content": text }));
     }
 
+    /// Re-route the next request. A `provider/model` route also swaps the
+    /// provider, so one session can move between vendors mid-conversation.
     fn switch_model(&mut self, model: String) {
+        let model = match &self.providers {
+            Some(set) => {
+                let (provider, model) = set.resolve(&model);
+                self.provider = provider;
+                model
+            }
+            None => model,
+        };
         self.live.set_model(&model);
         self.model = model;
     }

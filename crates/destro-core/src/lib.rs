@@ -8,9 +8,14 @@
 pub mod advisor;
 pub mod agent;
 pub mod bus;
+pub mod context;
+pub mod dsh;
 pub mod gate;
 pub mod harness;
+pub mod mcp;
 pub mod provider;
+pub mod skills;
+pub mod store;
 pub mod tools_ctl;
 
 pub use advisor::{advisor_system, slave_system};

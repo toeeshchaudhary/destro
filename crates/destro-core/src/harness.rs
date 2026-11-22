@@ -35,6 +35,8 @@ pub struct SpawnSpec {
     /// Send this as the agent's first user message.
     pub prompt: Option<String>,
     pub priority: Option<Priority>,
+    /// Prior conversation (neutral chat messages) to start from: resume.
+    pub history: Vec<serde_json::Value>,
 }
 
 /// Providers addressable by a `provider/model` route string.
@@ -152,7 +154,7 @@ pub struct Harness {
 impl Harness {
     pub fn new(cfg: HarnessConfig) -> Arc<Harness> {
         let tool_host: ToolHost = Arc::new(OnceLock::new());
-        let mut registry = Registry::builtin();
+        let registry = Registry::builtin();
         for tool in control_tools(tool_host.clone()) {
             registry.register(tool);
         }
@@ -251,6 +253,8 @@ impl Harness {
             max_tokens: self.max_tokens,
             max_steps: self.max_steps,
             priority,
+            history: spec.history,
+            providers: self.providers.clone(),
         };
         tokio::spawn(AgentTask::new(init, cancel).run(rx));
 

@@ -12,6 +12,10 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 
+use destro_core::context;
+use destro_core::mcp::{McpHub, McpStatus};
+use destro_core::skills::{self, SkillTool};
+use destro_core::store::SessionWriter;
 use destro_core::{
     AgentId, Delivery, Harness, HarnessConfig, HarnessEvent, ProviderSet, SpawnSpec,
 };
@@ -53,6 +57,9 @@ struct Slot {
     name: String,
     #[allow(dead_code)]
     setup: Setup,
+    mcp: Arc<McpHub>,
+    /// Model chosen with `/model`; new sessions start on it.
+    model_override: Arc<Mutex<Option<String>>>,
 }
 
 /// The routes a slot's harness was built with; kept so advisor mode can rebuild.
@@ -88,6 +95,7 @@ pub struct Local {
     tx: Sender<Msg>,
     model: String,
     providers: Arc<ProviderSet>,
+    persist: bool,
 }
 
 impl Local {
@@ -96,6 +104,7 @@ impl Local {
         model: &str,
         provider: Arc<ProviderSet>,
         tx: Sender<Msg>,
+        persist: bool,
     ) -> (Vec<Project>, Local) {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -113,6 +122,7 @@ impl Local {
                 normal_setup(model),
                 provider.clone(),
                 &tx,
+                persist,
             )));
         }
         let backend = Local {
@@ -121,6 +131,7 @@ impl Local {
             tx,
             model: model.to_string(),
             providers: provider,
+            persist,
         };
         let projects = specs
             .iter()
@@ -129,6 +140,7 @@ impl Local {
         (projects, backend)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn slot(
         rt: &tokio::runtime::Runtime,
         index: usize,
@@ -137,15 +149,33 @@ impl Local {
         setup: Setup,
         providers: Arc<ProviderSet>,
         tx: &Sender<Msg>,
+        persist: bool,
     ) -> Slot {
+        let root = std::path::PathBuf::from(cwd);
+        // Conventions: the AGENTS.md / CLAUDE.md chain and the skill catalogue go
+        // into every agent's system prompt, planner and workers alike.
+        let instr = context::load_instructions(&root);
+        let found_skills = skills::discover_skills(&root);
         let mut cfg = HarnessConfig::new(providers.default_provider());
         cfg.providers = Some(providers);
         cfg.model = setup.model.clone();
-        cfg.cwd = std::path::PathBuf::from(cwd);
-        cfg.system = setup.system.clone();
+        cfg.cwd = root.clone();
+        cfg.system = context::assemble(&setup.system, &root, &instr, &found_skills);
         cfg.slave_model = setup.slave_model.clone();
-        cfg.slave_system = setup.slave_system.clone();
+        cfg.slave_system = setup
+            .slave_system
+            .as_ref()
+            .map(|s| context::assemble(s, &root, &instr, &found_skills));
         let harness = Harness::new(cfg);
+        if !found_skills.is_empty() {
+            harness
+                .tools
+                .register(Arc::new(SkillTool::new(found_skills)));
+        }
+        let mcp = McpHub::start(&root, harness.tools.clone(), rt.handle().clone());
+        let writers: Arc<Mutex<HashMap<String, SessionWriter>>> = Arc::default();
+        let pump_harness = harness.clone();
+        let pump_cwd = cwd.to_string();
         let sessions: Sessions = Arc::new(Mutex::new(Map::default()));
         let mut rx = harness.subscribe();
         let out = tx.clone();
@@ -155,6 +185,22 @@ impl Local {
                 match rx.recv().await {
                     Ok(HarnessEvent::Session { agent, event, .. }) => {
                         let session = map.lock().unwrap().session_of(agent);
+                        // Root sessions are durable; subagent ids restart every run.
+                        if persist
+                            && let Some(h) = pump_harness.get(agent)
+                            && h.live.parent.is_none()
+                        {
+                            let mut w = writers.lock().unwrap();
+                            if !w.contains_key(&session)
+                                && let Ok(nw) =
+                                    SessionWriter::open(&pump_cwd, &session, &h.live.model())
+                            {
+                                w.insert(session.clone(), nw);
+                            }
+                            if let Some(wr) = w.get_mut(&session) {
+                                wr.append(&event);
+                            }
+                        }
                         emit(
                             &out,
                             index,
@@ -221,6 +267,8 @@ impl Local {
             cwd: cwd.to_string(),
             name: name.to_string(),
             setup,
+            mcp,
+            model_override: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -238,12 +286,14 @@ impl Local {
                 return Some(id);
             }
             let cwd = std::path::PathBuf::from(&slot.cwd);
+            let model = slot.model_override.lock().unwrap().clone();
             let handle = self.rt.block_on(async {
                 slot.harness.spawn(
                     None,
                     SpawnSpec {
                         title: Some(session.to_string()),
                         cwd: Some(cwd),
+                        model,
                         ..SpawnSpec::default()
                     },
                 )
@@ -424,6 +474,7 @@ impl Backend for Local {
             normal_setup(&self.model),
             self.providers.clone(),
             &self.tx,
+            self.persist,
         );
         self.slots.lock().unwrap()[project] = Some(slot);
     }
@@ -443,9 +494,73 @@ impl Backend for Local {
             advisor_setup(advisor, slave),
             self.providers.clone(),
             &self.tx,
+            self.persist,
         );
         if let Some(s) = self.slots.lock().unwrap().get_mut(project) {
             *s = Some(slot);
         }
+    }
+
+    fn restore(&self, project: usize, session: &str, history: Vec<Value>, model: &str) {
+        self.with_slot(project, |slot| {
+            if slot.sessions.lock().unwrap().agent(session).is_some() {
+                return;
+            }
+            let model = if model.is_empty() {
+                slot.model_override.lock().unwrap().clone()
+            } else {
+                Some(model.to_string())
+            };
+            let spawned = self.rt.block_on(async {
+                slot.harness.spawn(
+                    None,
+                    SpawnSpec {
+                        title: Some(session.to_string()),
+                        cwd: Some(std::path::PathBuf::from(&slot.cwd)),
+                        model,
+                        history,
+                        ..SpawnSpec::default()
+                    },
+                )
+            });
+            if let Ok(h) = spawned {
+                slot.sessions.lock().unwrap().bind(session, h.id);
+            }
+        });
+    }
+
+    fn set_model(&self, project: usize, session: Option<&str>, model: &str) {
+        self.with_slot(project, |slot| {
+            *slot.model_override.lock().unwrap() = Some(model.to_string());
+            if let Some(agent) = session.and_then(|s| slot.sessions.lock().unwrap().agent(s))
+                && let Some(h) = slot.harness.get(agent)
+            {
+                h.set_model(model);
+            }
+        });
+    }
+
+    fn mcp_status(&self, project: usize) -> Vec<McpStatus> {
+        self.with_slot(project, |slot| slot.mcp.statuses())
+            .unwrap_or_default()
+    }
+
+    fn mcp_do(&self, project: usize, server: &str, action: &str) {
+        self.with_slot(project, |slot| match action {
+            "approve" | "enable" => slot.mcp.set_enabled(server, true),
+            "disable" => slot.mcp.set_enabled(server, false),
+            "reconnect" => slot.mcp.reconnect(server),
+            _ => {}
+        });
+    }
+
+    fn interrupt(&self, project: usize, session: &str) {
+        self.with_slot(project, |slot| {
+            if let Some(agent) = slot.sessions.lock().unwrap().agent(session)
+                && let Some(h) = slot.harness.get(agent)
+            {
+                h.interrupt();
+            }
+        });
     }
 }

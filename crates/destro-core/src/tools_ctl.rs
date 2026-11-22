@@ -154,6 +154,7 @@ impl Tool for SubagentTool {
                 cwd: Some(cx.cwd.clone()),
                 prompt: Some(prompt),
                 priority: None,
+                history: Vec::new(),
             };
             let handle = match harness.spawn(Some(parent), spec) {
                 Ok(h) => h,

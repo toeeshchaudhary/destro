@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 mod args;
 mod paths;
@@ -69,9 +69,9 @@ pub struct ToolContext {
 /// Implementations must be cheap to clone by `Arc`, hence `Send + Sync`.
 pub trait Tool: Send + Sync {
     /// The unique tool name.
-    fn name(&self) -> &'static str;
+    fn name(&self) -> &str;
     /// A short description shown to the model.
-    fn description(&self) -> &'static str;
+    fn description(&self) -> &str;
     /// JSON Schema object describing the accepted arguments.
     fn schema(&self) -> serde_json::Value;
     /// Runs the tool. Malformed arguments must be reported as an error output.
@@ -82,7 +82,7 @@ pub trait Tool: Send + Sync {
 /// A set of tools addressable by name.
 #[derive(Default)]
 pub struct Registry {
-    tools: HashMap<String, Arc<dyn Tool>>,
+    tools: RwLock<HashMap<String, Arc<dyn Tool>>>,
 }
 
 impl Registry {
@@ -91,7 +91,7 @@ impl Registry {
     /// The built-ins are `read`, `write`, `edit`, `glob`, `grep`, `pwsh` and
     /// `echo`.
     pub fn builtin() -> Registry {
-        let mut registry = Registry::default();
+        let registry = Registry::default();
         registry.register(Arc::new(tools::ReadTool));
         registry.register(Arc::new(tools::WriteTool));
         registry.register(Arc::new(tools::EditTool));
@@ -104,7 +104,7 @@ impl Registry {
 
     /// Creates a registry from an explicit list of tools.
     pub fn from_tools(tools: Vec<Arc<dyn Tool>>) -> Registry {
-        let mut registry = Registry::default();
+        let registry = Registry::default();
         for tool in tools {
             registry.register(tool);
         }
@@ -112,18 +112,32 @@ impl Registry {
     }
 
     /// Adds a tool, replacing any existing tool with the same name.
-    pub fn register(&mut self, tool: Arc<dyn Tool>) {
-        self.tools.insert(tool.name().to_owned(), tool);
+    ///
+    /// Takes `&self`: the registry is shared by running agents, and tools that
+    /// connect late (MCP servers) register after the harness has started.
+    pub fn register(&self, tool: Arc<dyn Tool>) {
+        self.tools
+            .write()
+            .unwrap()
+            .insert(tool.name().to_owned(), tool);
+    }
+
+    /// Removes every tool whose name starts with `prefix`; returns how many.
+    pub fn remove_prefix(&self, prefix: &str) -> usize {
+        let mut tools = self.tools.write().unwrap();
+        let before = tools.len();
+        tools.retain(|name, _| !name.starts_with(prefix));
+        before - tools.len()
     }
 
     /// Looks a tool up by name.
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
-        self.tools.get(name).cloned()
+        self.tools.read().unwrap().get(name).cloned()
     }
 
     /// Returns all registered tool names in sorted order.
-    pub fn names(&self) -> Vec<&'static str> {
-        let mut names: Vec<&'static str> = self.tools.values().map(|tool| tool.name()).collect();
+    pub fn names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.tools.read().unwrap().keys().cloned().collect();
         names.sort_unstable();
         names
     }
@@ -132,12 +146,13 @@ impl Registry {
     ///
     /// Each entry has the shape `{ "name", "description", "parameters" }`.
     pub fn schemas(&self) -> Vec<serde_json::Value> {
-        let mut names = self.names();
+        let tools = self.tools.read().unwrap();
+        let mut names: Vec<&String> = tools.keys().collect();
         names.sort_unstable();
         names
             .into_iter()
             .filter_map(|name| {
-                let tool = self.tools.get(name)?;
+                let tool = tools.get(name)?;
                 Some(serde_json::json!({
                     "name": tool.name(),
                     "description": tool.description(),
@@ -172,7 +187,7 @@ mod tests {
 
     #[test]
     fn register_replaces_and_default_is_empty() {
-        let mut registry = Registry::default();
+        let registry = Registry::default();
         assert!(registry.names().is_empty());
         registry.register(Arc::new(tools::EchoTool::new()));
         registry.register(Arc::new(tools::EchoTool));

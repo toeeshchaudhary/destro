@@ -20,6 +20,13 @@ pub enum Msg {
     Balance(Result<crate::balance::Info, String>),
     /// Runtime ended or failed to start.
     Exited { project: usize, why: String },
+    /// A dsh import finished.
+    Imported {
+        cwd: String,
+        new: usize,
+        skipped: usize,
+        failed: usize,
+    },
 }
 
 pub struct ProjectSpec {
@@ -37,6 +44,19 @@ pub trait Backend: Send + Sync {
     /// Arm advisor mode for a project: planner and worker model routes.
     /// Backends that cannot re-route ignore this.
     fn configure_advisor(&self, _project: usize, _advisor: &str, _slave: &str) {}
+    /// Re-create a stored session's agent with its conversation so it can continue.
+    fn restore(&self, _project: usize, _session: &str, _history: Vec<Value>, _model: &str) {}
+    /// Switch the model (`provider/model` routes allowed) for one session and
+    /// for sessions the workspace starts later.
+    fn set_model(&self, _project: usize, _session: Option<&str>, _model: &str) {}
+    /// MCP servers of a workspace and their state.
+    fn mcp_status(&self, _project: usize) -> Vec<destro_core::mcp::McpStatus> {
+        vec![]
+    }
+    /// `approve`, `enable`, `disable` or `reconnect` one MCP server.
+    fn mcp_do(&self, _project: usize, _server: &str, _action: &str) {}
+    /// Stop the running turn of one session without killing the runtime.
+    fn interrupt(&self, _project: usize, _session: &str) {}
 }
 
 #[derive(Default)]
