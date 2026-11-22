@@ -132,7 +132,7 @@ fn parse_args() -> Result<Args> {
                 let mode = match it.peek().map(String::as_str) {
                     Some(
                         "done" | "snippets" | "open" | "palette" | "themes" | "help" | "slash"
-                        | "fresh" | "model" | "context" | "question" | "textbox",
+                        | "fresh" | "model" | "context" | "question" | "textbox" | "swarm",
                     ) => it.next().unwrap(),
                     _ => String::new(),
                 };
@@ -258,6 +258,35 @@ fn snapshot(mode: &str) -> Result<()> {
             app.on_key(ratatui::crossterm::event::KeyEvent::from(
                 ratatui::crossterm::event::KeyCode::Enter,
             ));
+        }
+        "swarm" => {
+            // one chat that spawned many same-looking subagents, a few still working
+            let pr = &mut app.projects[0];
+            let root = pr.session_mut("root");
+            pr.sessions[root].title = Some("GTA6 Xbox build executable audit".into());
+            pr.sessions[root].status = model::Status::Running;
+            for i in 0..14 {
+                let id = format!("kid-{i}");
+                let ci = pr.session_mut(&id);
+                pr.sessions[ci].parent = Some("root".into());
+                pr.sessions[ci].title = Some(
+                    [
+                        "XVD format spec",
+                        "Extract game exe",
+                        "Entropy scan",
+                        "Find CIK keys",
+                    ][i % 4]
+                        .into(),
+                );
+                pr.sessions[ci].status = match i {
+                    3 | 9 => model::Status::Running,
+                    6 => model::Status::Failed,
+                    _ => model::Status::Idle,
+                };
+                pr.sessions[ci].last_tool = Some("pwsh".into());
+            }
+            app.cur_project = 0;
+            app.cur_session = Some(root);
         }
         "question" => app.on_frame(
             0,
@@ -527,6 +556,27 @@ fn run_import_dsh(args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// Append a background-thread panic to `crash.log` in the Destro data folder.
+fn log_crash(thread: &str, info: &std::panic::PanicHookInfo<'_>) {
+    use std::io::Write;
+    let Some(dir) = destro_core::context::data_dir() else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("crash.log"))
+    {
+        let _ = writeln!(
+            f,
+            "[{} {}] thread '{thread}': {info}",
+            destro_core::context::today(),
+            env!("CARGO_PKG_VERSION")
+        );
+    }
+}
+
 fn run_update() -> Result<()> {
     println!("checking for updates…");
     let started = Instant::now();
@@ -754,6 +804,17 @@ fn main() -> Result<()> {
         _ => {}
     }
     let mut terminal = ratatui::init();
+    // ratatui's hook restores the terminal on *any* thread's panic, which paints
+    // the message over the running UI. Keep it for the UI thread; log the rest.
+    let ui_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        if thread.name() == Some("main") {
+            ui_hook(info);
+        } else {
+            log_crash(thread.name().unwrap_or("?"), info);
+        }
+    }));
     let _ = ratatui::crossterm::execute!(
         std::io::stdout(),
         ratatui::crossterm::event::EnableBracketedPaste,

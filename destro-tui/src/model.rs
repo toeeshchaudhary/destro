@@ -10,6 +10,8 @@ use std::collections::{HashMap, VecDeque};
 use serde_json::Value;
 
 pub const MAX_ITEMS: usize = 20_000;
+/// More subagents than this and the sidebar collapses the finished ones.
+pub const COLLAPSE_ABOVE: usize = 6;
 const DROP_BATCH: usize = 2_000;
 const MAX_TOOL_TEXT: usize = 4_096;
 const MAX_ARGS_TEXT: usize = 600;
@@ -29,6 +31,8 @@ pub enum Item {
         lang: Option<String>,
     },
     Notice(String),
+    /// A message a parent agent sent to this subagent (its task).
+    Delegated(String),
 }
 
 /// A code block or file body worth keeping for the snippet viewer.
@@ -84,6 +88,8 @@ pub struct Session {
     pub cache: crate::ui::LineCache,
     /// When the current turn began (drives the elapsed-time readout).
     pub started: Option<std::time::Instant>,
+    /// Show every subagent under this session, not just the active ones.
+    pub expanded: bool,
 }
 
 impl Session {
@@ -105,6 +111,7 @@ impl Session {
             snippets: vec![],
             cache: Default::default(),
             started: None,
+            expanded: false,
         }
     }
 
@@ -169,7 +176,12 @@ impl Session {
                 // synthetic injections (file notices, cron, skills) are not human prompts
                 let text = blocks_text(&data["content"]);
                 let kind = data["source"]["kind"].as_str().unwrap_or("user");
-                if kind == "user" || kind.is_empty() {
+                if self.parent.is_some()
+                    && (kind == "user" || kind == "subagent" || kind.is_empty())
+                {
+                    // in a subagent, every user-role message comes from its parent
+                    self.push(Item::Delegated(text));
+                } else if kind == "user" || kind.is_empty() {
                     if self.title.is_none() {
                         self.title =
                             Some(text.chars().take(48).collect::<String>().replace('\n', " "));
@@ -374,6 +386,52 @@ impl Project {
         if self.log.len() > 200 {
             self.log.pop_front();
         }
+    }
+
+    /// Subagents of `idx` to list in the sidebar. A session with many of them
+    /// shows only the ones that need attention (running or failed) plus the path
+    /// to the selected one, until it is expanded.
+    pub fn visible_kids(&self, idx: usize, cur: Option<usize>) -> Vec<usize> {
+        let kids = self.children_of(&self.sessions[idx].id);
+        if kids.len() <= COLLAPSE_ABOVE || self.sessions[idx].expanded {
+            return kids;
+        }
+        kids.into_iter()
+            .filter(|&c| {
+                self.sessions[c].status != Status::Idle
+                    || Some(c) == cur
+                    || cur.is_some_and(|cu| self.is_ancestor(c, cu))
+            })
+            .collect()
+    }
+
+    /// Whether session `anc` is a (transitive) parent of `of`.
+    pub fn is_ancestor(&self, anc: usize, of: usize) -> bool {
+        let mut at = of;
+        for _ in 0..32 {
+            let Some(&p) = self.sessions[at]
+                .parent
+                .as_ref()
+                .and_then(|p| self.index.get(p))
+            else {
+                return false;
+            };
+            if p == anc {
+                return true;
+            }
+            at = p;
+        }
+        false
+    }
+
+    /// 1-based position among its siblings, and whether it is the last one.
+    pub fn sibling_slot(&self, idx: usize) -> (usize, bool) {
+        let Some(parent) = self.sessions[idx].parent.as_ref() else {
+            return (0, true);
+        };
+        let kids = self.children_of(parent);
+        let pos = kids.iter().position(|&k| k == idx).unwrap_or(0);
+        (pos + 1, pos + 1 == kids.len())
     }
 
     pub fn children_of(&self, id: &str) -> Vec<usize> {

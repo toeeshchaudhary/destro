@@ -337,3 +337,43 @@ async fn nested_instructions_ride_along_with_the_first_read_in_a_subfolder() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A tool that panics.
+struct Boom;
+
+impl Tool for Boom {
+    fn name(&self) -> &str {
+        "boom"
+    }
+    fn description(&self) -> &str {
+        "panics"
+    }
+    fn schema(&self) -> Value {
+        json!({"type":"object","properties":{}})
+    }
+    fn run<'a>(&'a self, _: &'a ToolInvocation, _: &'a ToolContext) -> BoxFuture<'a, ToolOutput> {
+        Box::pin(async move { panic!("byte index 12 is not a char boundary") })
+    }
+}
+
+#[tokio::test]
+async fn a_panicking_tool_is_reported_and_the_agent_survives() {
+    let script = Script::new(vec![vec![call("b1", "boom", json!({}))]]);
+    let h = Harness::new(HarnessConfig::new(script.clone()));
+    h.tools.register(Arc::new(Boom));
+    let agent = h.spawn(None, SpawnSpec::default()).unwrap();
+    agent.send("go", Delivery::Queue).unwrap();
+    agent.wait().await;
+    let result = {
+        let seen = script.seen.lock();
+        last_tool_text(&seen[1])
+    };
+    assert!(
+        result.contains("crashed") && result.contains("not a char boundary"),
+        "{result}"
+    );
+    // still alive: it answers the next message
+    agent.send("again", Delivery::Queue).unwrap();
+    agent.wait().await;
+    assert_eq!(agent.status(), destro_core::AgentStatus::Idle);
+}

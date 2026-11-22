@@ -149,6 +149,7 @@ fn peek_title(file: &Path) -> String {
     let text = String::from_utf8_lossy(&buf);
     let mut label = String::new();
     let mut first_user = String::new();
+    let mut fallback = String::new();
     for line in text.split('\n') {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
             continue; // includes the cut-off last line
@@ -156,7 +157,13 @@ fn peek_title(file: &Path) -> String {
         match v["type"].as_str() {
             Some("session/title") => {
                 if let Some(t) = v["data"]["title"].as_str() {
-                    return t.to_string();
+                    // dsh's own fallback title is just the first words of the
+                    // prompt; a real title (or a subagent's label) is better
+                    if v["data"]["source"]["kind"] == "fallback" {
+                        fallback = t.to_string();
+                    } else {
+                        return t.to_string();
+                    }
                 }
             }
             Some("subagent/descriptor") => {
@@ -174,6 +181,9 @@ fn peek_title(file: &Path) -> String {
     }
     if !label.is_empty() {
         return label;
+    }
+    if !fallback.is_empty() {
+        return fallback;
     }
     first_user
         .lines()
@@ -293,6 +303,7 @@ fn image_note(block: &Value, home: Option<&Path>) -> String {
     let id = block["attachment"]["attachmentId"].as_str().unwrap_or("");
     let hash = id.strip_prefix("sha256:").unwrap_or(id);
     if hash.len() >= 2
+        && hash.is_ascii()
         && let Some(h) = home
     {
         let p = h
@@ -315,6 +326,7 @@ pub fn convert(rows: &[Value], home: Option<&Path>) -> (Vec<Value>, String, Stri
     let mut label = String::new();
     let mut model = String::new();
     let mut last_ms = 0u64;
+    let mut fallback_title: Option<String> = None;
     for r in rows {
         let d = &r["data"];
         if let Some(t) = r["time"].as_u64() {
@@ -378,8 +390,14 @@ pub fn convert(rows: &[Value], home: Option<&Path>) -> (Vec<Value>, String, Stri
             }
             "session/title" => {
                 if let Some(t) = d["title"].as_str() {
-                    title = t.to_string();
-                    out.push(json!({"type":"session/title","data":{"title":t}}));
+                    // fallback titles ("You are on Windows 11 …") make every
+                    // subagent look the same; the descriptor label replaces them
+                    if d["source"]["kind"] == "fallback" {
+                        fallback_title = Some(t.to_string());
+                    } else {
+                        title = t.to_string();
+                        out.push(json!({"type":"session/title","data":{"title":t}}));
+                    }
                 }
             }
             "request/context" if d["contextWindow"].is_u64() => {
@@ -390,9 +408,16 @@ pub fn convert(rows: &[Value], home: Option<&Path>) -> (Vec<Value>, String, Stri
             _ => {}
         }
     }
-    if title.is_empty() && !label.is_empty() {
-        title = label.clone();
-        out.insert(0, json!({"type":"session/title","data":{"title":label}}));
+    if title.is_empty() {
+        let best = if !label.is_empty() {
+            Some(label.clone())
+        } else {
+            fallback_title
+        };
+        if let Some(t) = best {
+            title = t.clone();
+            out.insert(0, json!({"type":"session/title","data":{"title":t}}));
+        }
     }
     (out, title, model, last_ms)
 }

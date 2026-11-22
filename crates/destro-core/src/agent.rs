@@ -926,11 +926,23 @@ impl AgentTask {
             cwd: self.cwd.clone(),
             agent_id: self.id.wire(),
         };
-        let fut = tool.run(&invocation, &context);
+        use futures_util::FutureExt;
+        let fut = std::panic::AssertUnwindSafe(tool.run(&invocation, &context)).catch_unwind();
         let out = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(ToolFail::Interrupted),
-            out = fut => out,
+            out = fut => match out {
+                Ok(o) => o,
+                // report it to the model instead of silently killing this agent
+                Err(payload) => {
+                    let why = payload
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown panic".into());
+                    destro_tools::ToolOutput::err(format!("tool `{name}` crashed: {why}"))
+                }
+            },
         };
         if out.is_error {
             return Ok((format!("error: {}", out.content), true));

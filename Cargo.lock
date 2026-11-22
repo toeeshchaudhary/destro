@@ -435,7 +435,7 @@ dependencies = [
 
 [[package]]
 name = "destro-core"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "destro-proto",
@@ -454,7 +454,7 @@ dependencies = [
 
 [[package]]
 name = "destro-proto"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -462,7 +462,7 @@ dependencies = [
 
 [[package]]
 name = "destro-runtime"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "destro-core",
@@ -475,7 +475,7 @@ dependencies = [
 
 [[package]]
 name = "destro-tools"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "futures-core",
  "globset",
@@ -490,7 +490,7 @@ dependencies = [
 
 [[package]]
 name = "destro-tui"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "destro-core",

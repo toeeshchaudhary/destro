@@ -122,31 +122,64 @@ fn layout_item(item: &Item, width: usize, out: &mut Vec<Line<'static>>) {
             let lines = wrap(t, w.saturating_sub(4));
             let n = lines.len();
             let st = theme::muted().add_modifier(ratatui::style::Modifier::ITALIC);
-            for (i, l) in lines.into_iter().take(3).enumerate() {
+            for (i, l) in lines.into_iter().take(2).enumerate() {
                 let mark = if i == 0 { "◌ " } else { "┊ " };
                 out.push(Line::from(vec![
                     Span::styled(format!("  {mark}"), theme::accent2()),
                     Span::styled(l, st),
                 ]));
             }
-            if n > 3 {
+            if n > 2 {
                 out.push(Line::styled(
-                    format!("  ┊ … {} more lines of reasoning", n - 3),
-                    theme::muted(),
+                    format!("  ┊ … {} more lines of reasoning", n - 2),
+                    theme::faint(),
                 ));
             }
         }
         Item::ToolCall { name, args } => {
-            let a = args.replace('\n', " ");
-            let room = width.saturating_sub(name.width() + 8);
+            let (prefix, summary) = tool_summary(name, args);
+            let room = width.saturating_sub(name.width() + prefix.width() + 8);
             out.push(Line::from(vec![
                 Span::styled("  ▸ ", theme::accent2()),
                 Span::styled(
                     name.clone(),
                     theme::accent2().add_modifier(ratatui::style::Modifier::BOLD),
                 ),
-                Span::styled(format!("  {}", truncate(&a, room)), theme::muted()),
+                Span::styled(format!("  {prefix}"), theme::muted()),
+                Span::styled(truncate(&summary, room), theme::text()),
             ]));
+        }
+        Item::Delegated(t) => {
+            // what the parent asked this subagent to do
+            let bg = theme::sel();
+            let bar = Span::styled(
+                " ▌ ",
+                theme::accent2().add_modifier(ratatui::style::Modifier::BOLD),
+            );
+            out.push(Line::raw("").style(bg));
+            out.push(
+                Line::from(vec![
+                    bar.clone(),
+                    Span::styled(" TASK FROM PARENT ", theme::chip(theme::cur().accent2)),
+                ])
+                .style(bg),
+            );
+            let lines = wrap(t, w);
+            let n = lines.len();
+            for l in lines.into_iter().take(6) {
+                out.push(Line::from(vec![bar.clone(), Span::styled(l, theme::text())]).style(bg));
+            }
+            if n > 6 {
+                out.push(
+                    Line::from(vec![
+                        bar.clone(),
+                        Span::styled(format!("… {} more lines", n - 6), theme::muted()),
+                    ])
+                    .style(bg),
+                );
+            }
+            out.push(Line::raw("").style(bg));
+            out.push(Line::raw(""));
         }
         Item::ToolResult {
             is_error,
@@ -165,7 +198,7 @@ fn layout_item(item: &Item, width: usize, out: &mut Vec<Line<'static>>) {
                 let (mark, mst) = match (i, *is_error) {
                     (0, true) => ("✗ ", theme::err()),
                     (0, false) => ("✓ ", theme::ok()),
-                    _ => ("  ", theme::muted()),
+                    _ => ("│ ", theme::faint()),
                 };
                 let st = if *is_error {
                     theme::err()
@@ -415,7 +448,19 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
                 let pr = &app.projects[p];
                 let se = &pr.sessions[s];
                 let pend = pr.approvals.iter().any(|a| a.session_id == se.id);
-                let pad = "  ".repeat(depth + 1);
+                let child = se.parent.is_some() && depth > 0;
+                let (ord, last) = pr.sibling_slot(s);
+                let tree = if !child {
+                    ""
+                } else if last {
+                    "└ "
+                } else {
+                    "├ "
+                };
+                let pad = format!("{}{}", "  ".repeat(depth), if child { "" } else { " " });
+                let hidden = pr.children_of(&se.id).len()
+                    - pr.visible_kids(s, app.cur_session.filter(|_| p == app.cur_project))
+                        .len();
                 let mark = if pend {
                     Span::styled(
                         "!",
@@ -426,21 +471,43 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
                 } else {
                     Span::raw(" ")
                 };
-                let label = truncate(&se.label(), w.saturating_sub(pad.len() + 5));
+                let tag = if child {
+                    format!("#{ord} ")
+                } else {
+                    String::new()
+                };
+                let suffix = if hidden > 0 {
+                    format!("  +{hidden}")
+                } else {
+                    String::new()
+                };
+                let room =
+                    w.saturating_sub(pad.width() + tree.width() + tag.width() + suffix.width() + 6);
+                let label = truncate(&se.label(), room);
                 let st = if selected {
                     theme::bold()
                 } else if se.status == Status::Running {
-                    theme::text()
+                    theme::accent_b()
+                } else if se.status == Status::Failed {
+                    theme::err()
                 } else {
                     theme::muted()
+                };
+                let glyph = if child && se.status == Status::Idle {
+                    Span::styled("✓", theme::ok())
+                } else {
+                    status_glyph(se.status, app.tick)
                 };
                 lines.push(
                     Line::from(vec![
                         Span::raw(" "),
                         mark,
                         Span::raw(pad),
-                        status_glyph(se.status, app.tick),
-                        Span::styled(format!(" {label}"), st),
+                        Span::styled(tree, theme::faint()),
+                        glyph,
+                        Span::styled(format!(" {tag}"), theme::accent2()),
+                        Span::styled(label, st),
+                        Span::styled(suffix, theme::warn()),
                     ])
                     .style(bg),
                 );
@@ -492,6 +559,14 @@ fn draw_main(f: &mut Frame, app: &mut App, area: Rect) {
     if let Some(si) = cs {
         let se = &pr.sessions[si];
         head.push(Span::styled("  ›  ", theme::faint()));
+        if se.parent.is_some() {
+            let (ord, _) = pr.sibling_slot(si);
+            head.push(Span::styled(
+                format!(" SUBAGENT #{ord} "),
+                theme::chip(theme::cur().accent2),
+            ));
+            head.push(Span::raw(" "));
+        }
         head.push(Span::styled(truncate(&se.label(), 40), theme::text()));
         head.push(Span::styled(
             format!("   turn {} · {}", se.turn, pr.model),
@@ -937,23 +1012,56 @@ fn draw_right(f: &mut Frame, app: &App, area: Rect) {
         l.push(Line::raw(""));
     }
     l.push(section("AGENTS", w));
-    l.push(Line::styled(
-        format!(
-            " {} running / {} total",
-            run + (pr.sessions[root].status == Status::Running) as usize,
-            kids.len() + 1
+    let finished = kids
+        .iter()
+        .filter(|&&c| pr.sessions[c].status == Status::Idle)
+        .count();
+    let failed = kids
+        .iter()
+        .filter(|&&c| pr.sessions[c].status == Status::Failed)
+        .count();
+    let running_total = run + (pr.sessions[root].status == Status::Running) as usize;
+    l.push(Line::from(vec![
+        Span::styled(format!(" {running_total} running"), theme::accent_b()),
+        Span::styled(format!(" · {finished} done"), theme::ok()),
+        Span::styled(
+            if failed > 0 {
+                format!(" · {failed} failed")
+            } else {
+                String::new()
+            },
+            theme::err(),
         ),
-        theme::muted(),
-    ));
-    let mut push_agent = |s: &Session, name: &str, sel: bool, tree: &str| {
+    ]));
+    let mut push_agent = |s: &Session, ord: usize, name: &str, sel: bool, tree: &str| {
         let bg = if sel { theme::sel() } else { Style::default() };
+        let tag = if ord > 0 {
+            format!("#{ord} ")
+        } else {
+            String::new()
+        };
+        let label_style = if sel {
+            theme::bold()
+        } else if s.status == Status::Running {
+            theme::accent_b()
+        } else if s.status == Status::Failed {
+            theme::err()
+        } else {
+            theme::muted()
+        };
+        let glyph = if ord > 0 && s.status == Status::Idle {
+            Span::styled("✓", theme::ok())
+        } else {
+            status_glyph(s.status, app.tick)
+        };
         l.push(
             Line::from(vec![
                 Span::styled(format!(" {tree}"), theme::faint()),
-                status_glyph(s.status, app.tick),
+                glyph,
+                Span::styled(format!(" {tag}"), theme::accent2()),
                 Span::styled(
-                    format!(" {}", truncate(name, w.saturating_sub(7))),
-                    if sel { theme::bold() } else { theme::text() },
+                    truncate(name, w.saturating_sub(tree.width() + tag.width() + 4)),
+                    label_style,
                 ),
             ])
             .style(bg),
@@ -967,16 +1075,43 @@ fn draw_right(f: &mut Frame, app: &App, area: Rect) {
             ));
         }
     };
-    push_agent(&pr.sessions[root], "main", root == si, "");
+    push_agent(&pr.sessions[root], 0, "main", root == si, "");
+    // active and failed agents always show; finished ones are summarised
+    // unless the tree is expanded (Ctrl+E)
+    let expanded = pr.sessions[root].expanded || kids.len() <= crate::model::COLLAPSE_ABOVE;
+    let recent_done: Vec<usize> = kids
+        .iter()
+        .copied()
+        .filter(|&c| pr.sessions[c].status == Status::Idle)
+        .rev()
+        .take(3)
+        .collect();
+    let mut hidden = 0usize;
     let nk = kids.len();
     for (i, &c) in kids.iter().enumerate() {
-        let name = pr.sessions[c].label();
+        let s = &pr.sessions[c];
+        let show = expanded
+            || s.status != Status::Idle
+            || c == si
+            || recent_done.contains(&c)
+            || pr.is_ancestor(c, si);
+        if !show {
+            hidden += 1;
+            continue;
+        }
         push_agent(
-            &pr.sessions[c],
-            &name,
+            s,
+            pr.sibling_slot(c).0,
+            &s.label(),
             c == si,
             if i + 1 == nk { "└ " } else { "├ " },
         );
+    }
+    if hidden > 0 {
+        l.push(Line::styled(
+            format!("  … {hidden} finished hidden · Ctrl+E all"),
+            theme::muted(),
+        ));
     }
     l.push(Line::raw(""));
 
@@ -1791,4 +1926,104 @@ fn draw_question(f: &mut Frame, app: &App, area: Rect) {
     hl.extend(hint("Esc", "skip"));
     l.push(Line::from(hl));
     f.render_widget(Paragraph::new(l), inner);
+}
+
+/// A string field of a tool's JSON arguments, tolerating arguments that were
+/// cut off mid-string (the TUI stores them truncated).
+fn json_field(raw: &str, keys: &[&str]) -> Option<String> {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
+        return keys.iter().find_map(|k| v[*k].as_str().map(str::to_string));
+    }
+    for k in keys {
+        let needle = format!("\"{k}\"");
+        let Some(at) = raw.find(&needle) else {
+            continue;
+        };
+        let rest = raw[at + needle.len()..].trim_start();
+        let Some(rest) = rest.strip_prefix(':') else {
+            continue;
+        };
+        let Some(rest) = rest.trim_start().strip_prefix('"') else {
+            continue;
+        };
+        let mut out = String::new();
+        let mut chars = rest.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '"' => break,
+                '\\' => match chars.next() {
+                    Some('n') => out.push('\n'),
+                    Some('t') => out.push('\t'),
+                    Some(o) => out.push(o),
+                    None => break,
+                },
+                c => out.push(c),
+            }
+        }
+        return Some(out);
+    }
+    None
+}
+
+/// `(prefix, text)` for a tool call line: what it will do, not its raw JSON.
+fn tool_summary(name: &str, args: &str) -> (&'static str, String) {
+    let flat = |s: String| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let found = match name {
+        "pwsh" => json_field(args, &["command"]).map(|c| ("$ ", flat(c))),
+        "read" | "write" | "edit" => json_field(args, &["path", "file_path"]).map(|p| ("", p)),
+        "glob" => json_field(args, &["pattern"]).map(|p| ("", p)),
+        "grep" => json_field(args, &["pattern"]).map(|p| ("/", p)),
+        "web_search" => json_field(args, &["query"]).map(|q| ("? ", q)),
+        "web_fetch" => json_field(args, &["url"]).map(|u| ("", u)),
+        "skill" => json_field(args, &["name"]).map(|n| ("", n)),
+        "ask_user" => json_field(args, &["question"]).map(|q| ("? ", flat(q))),
+        "subagent" => json_field(args, &["title", "prompt"]).map(|t| ("", flat(t))),
+        _ => None,
+    };
+    match found {
+        Some((p, t)) if !t.is_empty() => (p, t),
+        _ => ("", args.replace('\n', " ")),
+    }
+}
+
+#[cfg(test)]
+mod summary_tests {
+    use super::*;
+
+    #[test]
+    fn tool_calls_read_like_what_they_do() {
+        assert_eq!(
+            tool_summary(
+                "pwsh",
+                r#"{"command":"cargo test -p x\nls","description":"d"}"#
+            ),
+            ("$ ", "cargo test -p x ls".to_string())
+        );
+        assert_eq!(
+            tool_summary("read", r#"{"path":"src/lib.rs","offset":3}"#),
+            ("", "src/lib.rs".to_string())
+        );
+        assert_eq!(
+            tool_summary("web_search", r#"{"query":"rust ratatui"}"#),
+            ("? ", "rust ratatui".to_string())
+        );
+    }
+
+    #[test]
+    fn truncated_arguments_still_yield_the_command() {
+        // the TUI keeps only the first ~600 bytes, so the JSON can end mid-string
+        let cut =
+            r#"{"command":"cd 'C:\\Users\\x'; Get-ChildItem -Recurse | Where-Object { $_.Len"#;
+        let (p, t) = tool_summary("pwsh", cut);
+        assert_eq!(p, "$ ");
+        assert!(t.starts_with("cd 'C:\\Users\\x'; Get-ChildItem"), "{t}");
+    }
+
+    #[test]
+    fn unknown_tools_fall_back_to_the_raw_arguments() {
+        assert_eq!(
+            tool_summary("mcp__s__t", r#"{"a":1}"#),
+            ("", r#"{"a":1}"#.to_string())
+        );
+    }
 }

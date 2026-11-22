@@ -30,7 +30,12 @@ pub fn decode_entities(s: &str) -> String {
     while let Some(i) = rest.find('&') {
         out.push_str(&rest[..i]);
         rest = &rest[i..];
-        let Some(end) = rest[..rest.len().min(12)].find(';') else {
+        // look at most 12 bytes ahead, but never cut a character in half
+        let mut window = rest.len().min(12);
+        while !rest.is_char_boundary(window) {
+            window -= 1;
+        }
+        let Some(end) = rest[..window].find(';') else {
             out.push('&');
             rest = &rest[1..];
             continue;
@@ -735,6 +740,26 @@ mod tests {
         assert_eq!(
             decode_entities("a &lt;b&gt; &amp; &#65;&#x42; &bogus; &"),
             "a <b> & AB &bogus; &"
+        );
+    }
+
+    #[test]
+    fn entities_never_slice_inside_a_multibyte_character() {
+        // regression: `&` followed by non-ASCII put byte 12 inside a character and panicked
+        for s in [
+            "&日本語のテキストです",
+            "&ééééééééééééé",
+            "x & 日本語日本語日本語日本語",
+            "&amp;日本語&lt;é",
+            "AT&T — “quoted” text & ünïcödé everywhere & more",
+            "&😀😀😀😀😀",
+        ] {
+            let _ = decode_entities(s);
+        }
+        assert_eq!(decode_entities("&amp;日本語&lt;é"), "&日本語<é");
+        assert!(
+            html_to_text("<p>Tom & 日本語日本語日本語 &amp; Jerry</p>")
+                .contains("Tom & 日本語日本語日本語 & Jerry")
         );
     }
 

@@ -188,6 +188,12 @@ pub const COMMANDS: &[Cmd] = &[
         arg: false,
     },
     Cmd {
+        name: "/agents",
+        keys: "Ctrl+E",
+        desc: "show every subagent, or only the active ones",
+        arg: false,
+    },
+    Cmd {
         name: "/kill",
         keys: "Ctrl+K",
         desc: "abort this workspace's runtime",
@@ -413,19 +419,31 @@ impl App {
             if p.collapsed {
                 continue;
             }
-            fn walk(p: &Project, pi: usize, idx: usize, depth: usize, rows: &mut Vec<Row>) {
+            fn walk(
+                p: &Project,
+                pi: usize,
+                idx: usize,
+                depth: usize,
+                cur: Option<usize>,
+                rows: &mut Vec<Row>,
+            ) {
                 rows.push(Row::Session(pi, idx, depth));
-                for c in p.children_of(&p.sessions[idx].id) {
-                    walk(p, pi, c, depth + 1, rows);
+                for c in p.visible_kids(idx, cur) {
+                    walk(p, pi, c, depth + 1, cur, rows);
                 }
             }
+            let cur = if pi == self.cur_project {
+                self.cur_session
+            } else {
+                None
+            };
             for (si, s) in p.sessions.iter().enumerate() {
                 let is_root = match &s.parent {
                     None => true,
                     Some(par) => !p.index.contains_key(par),
                 };
                 if is_root {
-                    walk(p, pi, si, 0, &mut rows);
+                    walk(p, pi, si, 0, cur, &mut rows);
                 }
             }
         }
@@ -629,6 +647,10 @@ impl App {
                 let ci = proj.session_mut(child);
                 proj.sessions[ci].parent = Some(parent);
                 proj.sessions[ci].status = Status::Running;
+                // the subagent's own name, not the first words of its task
+                if let Some(t) = params["title"].as_str().filter(|t| !t.trim().is_empty()) {
+                    proj.sessions[ci].title = Some(t.to_string());
+                }
             }
             "subagent.finished" => {
                 let child = params["childSessionId"].as_str().unwrap_or("");
@@ -1072,6 +1094,7 @@ impl App {
             }
             "/sidebar" => self.show_sidebar = !self.show_sidebar,
             "/panel" => self.show_right = !self.show_right,
+            "/agents" => self.toggle_agents(),
             "/quit" | "/exit" => self.quit = true,
             "/new" => self.cur_session = None,
             "/advisor" => self.enter_advisor(),
@@ -1260,6 +1283,7 @@ impl App {
                 }
             }
             KeyCode::Char('b') if ctrl => self.show_sidebar = !self.show_sidebar,
+            KeyCode::Char('e') if ctrl => self.toggle_agents(),
             KeyCode::Char('g') if ctrl => self.show_right = !self.show_right,
             KeyCode::Char('a') if ctrl => self.modal_hidden = false,
             KeyCode::Char('k') if ctrl => self.abort_runtime(),
@@ -2316,6 +2340,7 @@ impl App {
                     text
                 )),
                 Item::Notice(t) => md.push_str(&format!("_{t}_\n\n")),
+                Item::Delegated(t) => md.push_str(&format!("## Task from parent agent\n\n{t}\n\n")),
                 Item::Reasoning(_) => {}
             }
         }
@@ -2353,6 +2378,37 @@ impl App {
 }
 
 impl App {
+    // ----- agents ---------------------------------------------------------------------------
+
+    /// Ctrl+E: list every subagent of the selected session's tree, or only the
+    /// active ones.
+    pub fn toggle_agents(&mut self) {
+        let Some(si) = self.cur_session else {
+            self.flash("select a session first".into());
+            return;
+        };
+        let p = self.cur_project;
+        let mut root = si;
+        while let Some(&par) = self.projects[p].sessions[root]
+            .parent
+            .as_ref()
+            .and_then(|x| self.projects[p].index.get(x))
+        {
+            root = par;
+        }
+        let total = self.projects[p]
+            .children_of(&self.projects[p].sessions[root].id)
+            .len();
+        let s = &mut self.projects[p].sessions[root];
+        s.expanded = !s.expanded;
+        let msg = if s.expanded {
+            format!("showing all {total} subagents")
+        } else {
+            "showing active subagents only".to_string()
+        };
+        self.flash(msg);
+    }
+
     // ----- approvals, compaction ----------------------------------------------------------
 
     pub fn toggle_approvals(&mut self) {
