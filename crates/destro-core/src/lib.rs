@@ -18,7 +18,7 @@ pub use agent::{AgentHandle, AgentId, AgentStatus};
 pub use bus::{EventBus, HarnessEvent};
 pub use destro_proto::Delivery;
 pub use gate::{Gate, Priority};
-pub use harness::{Harness, HarnessConfig, HarnessStats, SpawnSpec};
+pub use harness::{Harness, HarnessConfig, HarnessStats, ProviderSet, SpawnSpec};
 pub use provider::{
     ChatRequest, MockProvider, MockToolCall, MockTurn, OpenAiCompatProvider, Provider,
     ProviderDescriptor, ProviderError, ProviderInfo, ProviderItem, ProviderKind, ProviderRegistry,

@@ -193,6 +193,25 @@ The registry only supplies **defaults and metadata**:
 So `ChatRequest.model` may be any model the endpoint serves, even one absent
 from `models`; the lists are advisory, not a validation gate.
 
+### Cross-provider routes
+
+A model string may name its provider: `vendor/model` (or `vendor:model`). The
+harness splits it, looks the vendor up in the configured set, and sends only the
+remainder as the model. This is how advisor mode runs a planner on one vendor and
+workers on another:
+
+```powershell
+destro --advisor --advisor-model refuseless/glm-5.3-flash-abliterated \
+                         --slave-model deepseek/deepseek-flash
+```
+
+Without a prefix the default provider is used. An unknown prefix is treated as
+part of the model name, so `org/model` style ids still pass through.
+
+Keys live in environment variables named by each descriptor's `apiKeyEnv`; the
+config file never stores a secret. For the two built-ins used above:
+`DESTRO_REFUSELESS_KEY` and `DEEPSEEK_API_KEY`.
+
 ---
 
 ## What implementations must guarantee

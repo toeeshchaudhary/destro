@@ -144,10 +144,11 @@ async fn inject_preempts_a_running_turn() {
 
     let mut interrupted = 0;
     while let Ok(ev) = events.try_recv() {
-        if let HarnessEvent::Session { event, .. } = ev {
-            if event["type"] == "turn/end" && event["data"]["reason"]["kind"] == "interrupted" {
-                interrupted += 1;
-            }
+        if let HarnessEvent::Session { event, .. } = ev
+            && event["type"] == "turn/end"
+            && event["data"]["reason"]["kind"] == "interrupted"
+        {
+            interrupted += 1;
         }
     }
     assert!(interrupted >= 1, "expected an interrupted turn");

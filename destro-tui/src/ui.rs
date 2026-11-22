@@ -1,20 +1,26 @@
-//! Rendering. Monochrome on purpose: weight, dim, reverse and a few glyphs carry
-//! all the meaning, so it reads the same on any terminal theme.
+//! Rendering. Every colour comes from the active [`theme`]; glyphs and weight
+//! carry the structure so even the `mono` theme stays readable.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, Mode, Row};
+use crate::app::{App, Cmd, Mode, Row};
 use crate::balance::Balance;
 use crate::highlight::{self, Highlighter, expand_tabs};
 use crate::md;
 use crate::model::{Conn, Item, Project, Session, Status, truncate};
+use crate::theme::{self, THEMES};
 
 const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const LOGO: [&str; 3] = [
+    "╺┳┓┏━╸┏━┓╺┳╸┏━┓┏━┓",
+    " ┃┃┣╸ ┗━┓ ┃ ┣┳┛┃ ┃",
+    "╺┻┛┗━╸┗━┛ ╹ ╹┗╸┗━┛",
+];
 
 /// Wrapped transcript lines for one session, built incrementally: items are
 /// append-only so only new items are laid out; a width change rebuilds.
@@ -44,16 +50,6 @@ impl LineCache {
         }
         self.rendered = s.items.len();
     }
-}
-
-fn dim() -> Style {
-    Style::default().add_modifier(Modifier::DIM)
-}
-fn bold() -> Style {
-    Style::default().add_modifier(Modifier::BOLD)
-}
-fn rev() -> Style {
-    Style::default().add_modifier(Modifier::REVERSED)
 }
 
 pub fn wrap(text: &str, width: usize) -> Vec<String> {
@@ -99,16 +95,22 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
 }
 
 fn layout_item(item: &Item, width: usize, out: &mut Vec<Line<'static>>) {
-    let w = width.saturating_sub(3).max(10);
+    let w = width.saturating_sub(4).max(10);
     match item {
         Item::User(t) => {
-            for (i, l) in wrap(t, w).into_iter().enumerate() {
-                let mark = if i == 0 { "▌ " } else { "  " };
-                out.push(Line::from(vec![
-                    Span::styled(mark, bold()),
-                    Span::styled(l, bold()),
-                ]));
+            // a tinted bubble with an accent bar down the left edge
+            let bg = theme::sel();
+            out.push(Line::raw("").style(bg));
+            for l in wrap(t, w) {
+                out.push(
+                    Line::from(vec![
+                        Span::styled(" ▌ ", theme::accent_b()),
+                        Span::styled(l, theme::bold()),
+                    ])
+                    .style(bg),
+                );
             }
+            out.push(Line::raw("").style(bg));
             out.push(Line::raw(""));
         }
         Item::Assistant(t) => {
@@ -116,26 +118,34 @@ fn layout_item(item: &Item, width: usize, out: &mut Vec<Line<'static>>) {
             out.push(Line::raw(""));
         }
         Item::Reasoning(t) => {
-            let lines = wrap(t, w.saturating_sub(2));
+            let lines = wrap(t, w.saturating_sub(4));
             let n = lines.len();
+            let st = theme::muted().add_modifier(ratatui::style::Modifier::ITALIC);
             for (i, l) in lines.into_iter().take(3).enumerate() {
-                let mark = if i == 0 { "· " } else { "  " };
-                out.push(Line::styled(
-                    format!("  {mark}{l}"),
-                    dim().add_modifier(Modifier::ITALIC),
-                ));
+                let mark = if i == 0 { "◌ " } else { "┊ " };
+                out.push(Line::from(vec![
+                    Span::styled(format!("  {mark}"), theme::accent2()),
+                    Span::styled(l, st),
+                ]));
             }
             if n > 3 {
                 out.push(Line::styled(
-                    format!("    … {} more lines of reasoning", n - 3),
-                    dim(),
+                    format!("  ┊ … {} more lines of reasoning", n - 3),
+                    theme::muted(),
                 ));
             }
         }
         Item::ToolCall { name, args } => {
             let a = args.replace('\n', " ");
-            let text = truncate(&format!("▸ {name}  {a}"), width.saturating_sub(4));
-            out.push(Line::from(vec![Span::raw("  "), Span::styled(text, dim())]));
+            let room = width.saturating_sub(name.width() + 8);
+            out.push(Line::from(vec![
+                Span::styled("  ▸ ", theme::accent2()),
+                Span::styled(
+                    name.clone(),
+                    theme::accent2().add_modifier(ratatui::style::Modifier::BOLD),
+                ),
+                Span::styled(format!("  {}", truncate(&a, room)), theme::muted()),
+            ]));
         }
         Item::ToolResult {
             is_error,
@@ -150,28 +160,37 @@ fn layout_item(item: &Item, width: usize, out: &mut Vec<Line<'static>>) {
             }
             let lines: Vec<&str> = text.lines().collect();
             for (i, l) in lines.iter().take(4).enumerate() {
-                let l = truncate(l, width.saturating_sub(8));
-                let mark = if i == 0 {
-                    if *is_error { "✗ " } else { "↳ " }
-                } else {
-                    "  "
+                let l = truncate(l, width.saturating_sub(10));
+                let (mark, mst) = match (i, *is_error) {
+                    (0, true) => ("✗ ", theme::err()),
+                    (0, false) => ("✓ ", theme::ok()),
+                    _ => ("  ", theme::muted()),
                 };
-                let st = if *is_error { rev() } else { dim() };
+                let st = if *is_error {
+                    theme::err()
+                } else {
+                    theme::muted()
+                };
                 out.push(Line::from(vec![
                     Span::raw("    "),
-                    Span::styled(format!("{mark}{l}"), st),
+                    Span::styled(mark, mst),
+                    Span::styled(l, st),
                 ]));
             }
             if lines.len() > 4 {
                 out.push(Line::styled(
                     format!("      … {} more lines", lines.len() - 4),
-                    dim(),
+                    theme::faint(),
                 ));
             }
             out.push(Line::raw(""));
         }
         Item::Notice(t) => {
-            out.push(Line::styled(format!("  ── {t} ──"), dim()));
+            out.push(Line::from(vec![
+                Span::styled("  ── ", theme::faint()),
+                Span::styled(t.clone(), theme::warn()),
+                Span::styled(" ──", theme::faint()),
+            ]));
             out.push(Line::raw(""));
         }
     }
@@ -179,9 +198,9 @@ fn layout_item(item: &Item, width: usize, out: &mut Vec<Line<'static>>) {
 
 fn status_glyph(st: Status, tick: u64) -> Span<'static> {
     match st {
-        Status::Running => Span::styled(SPIN[(tick as usize) % SPIN.len()], bold()),
-        Status::Idle => Span::styled("○", dim()),
-        Status::Failed => Span::styled("✗", rev()),
+        Status::Running => Span::styled(SPIN[(tick as usize) % SPIN.len()], theme::accent_b()),
+        Status::Idle => Span::styled("○", theme::muted()),
+        Status::Failed => Span::styled("✗", theme::err()),
     }
 }
 
@@ -195,17 +214,71 @@ fn k(n: u64) -> String {
     }
 }
 
-fn gauge(ratio: f64, width: usize) -> String {
-    let filled = (ratio * width as f64).round() as usize;
-    format!(
-        "{}{}",
-        "█".repeat(filled.min(width)),
-        "░".repeat(width - filled.min(width))
-    )
+/// Context gauge: green while there's room, amber then red as it fills.
+fn gauge(ratio: f64, width: usize) -> Vec<Span<'static>> {
+    let t = theme::cur();
+    let filled = ((ratio * width as f64).round() as usize).min(width);
+    let col = if ratio > 0.85 {
+        t.err
+    } else if ratio > 0.6 {
+        t.warn
+    } else {
+        t.ok
+    };
+    vec![
+        Span::styled("█".repeat(filled), Style::new().fg(col)),
+        Span::styled("░".repeat(width - filled), theme::faint()),
+    ]
+}
+
+/// `key` label pair: key in accent, label muted.
+fn hint(key: &str, label: &str) -> Vec<Span<'static>> {
+    vec![
+        Span::styled(key.to_string(), theme::accent_b()),
+        Span::styled(format!(" {label}"), theme::muted()),
+    ]
+}
+
+/// ` TITLE ───────` section rule.
+fn section(title: &str, w: usize) -> Line<'static> {
+    let used = title.width() + 2;
+    Line::from(vec![
+        Span::styled(format!(" {title} "), theme::accent_b()),
+        Span::styled("─".repeat(w.saturating_sub(used + 1)), theme::faint()),
+    ])
+}
+
+fn centered(area: Rect, w: u16, h: u16) -> Rect {
+    Rect {
+        x: area.x + area.width.saturating_sub(w) / 2,
+        y: area.y + area.height.saturating_sub(h) / 2,
+        width: w.min(area.width),
+        height: h.min(area.height),
+    }
+}
+
+/// Rounded popup on the surface colour. Returns the padded inner rect.
+fn modal(f: &mut Frame, area: Rect, w: u16, h: u16, title: Line<'static>, border: Style) -> Rect {
+    let r = centered(area, w, h);
+    f.render_widget(Clear, r);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(border)
+        .title(title)
+        .padding(Padding::new(1, 1, 0, 0))
+        .style(theme::surface());
+    let inner = block.inner(r);
+    f.render_widget(block, r);
+    inner
+}
+
+fn chip_title(label: &str, color: Color) -> Line<'static> {
+    Line::from(Span::styled(format!(" {label} "), theme::chip(color)))
 }
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
+    f.render_widget(Block::new().style(theme::base()), area);
     let show_side = app.show_sidebar && area.width >= 70;
     let show_right = app.show_right && area.width >= 110;
     let mut cons = vec![];
@@ -238,48 +311,95 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.setup.is_some() {
         draw_advisor_setup(f, app, area);
     }
+    if app.palette.is_some() {
+        draw_palette(f, app, area);
+    }
+    if app.themes.is_some() {
+        draw_theme_picker(f, app, area);
+    }
 }
 
 fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
-    let block = Block::default().borders(Borders::RIGHT).border_style(dim());
+    let block = Block::default()
+        .borders(Borders::RIGHT)
+        .border_style(theme::faint())
+        .style(theme::surface());
     let inner = block.inner(area);
     f.render_widget(block, area);
-    let mut lines: Vec<Line> = vec![
-        Line::from(vec![
-            Span::styled(" DESTRO", bold()),
-            Span::styled("  harness tui", dim()),
-        ]),
-        Line::raw(""),
-    ];
+    if inner.height < 6 {
+        return;
+    }
+    let parts = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(1),
+        Constraint::Length(3),
+    ])
+    .split(inner);
     let w = inner.width as usize;
-    for (ri, row) in app.rows().iter().enumerate() {
-        let selected = ri == app.cursor_row();
+
+    // brand
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::raw(""),
+            Line::from(vec![
+                Span::styled(" ◆ ", theme::accent_b()),
+                Span::styled("DESTRO", theme::bold()),
+                Span::styled(format!("  v{}", env!("CARGO_PKG_VERSION")), theme::muted()),
+            ]),
+            section("WORKSPACES", w),
+        ]),
+        parts[0],
+    );
+
+    // tree
+    let rows = app.rows();
+    let cursor = app.cursor_row();
+    let mut lines: Vec<Line> = Vec::with_capacity(rows.len());
+    for (ri, row) in rows.iter().enumerate() {
+        let selected = ri == cursor;
+        let bg = if selected {
+            theme::sel()
+        } else {
+            Style::default()
+        };
         match *row {
             Row::Project(p) => {
                 let pr = &app.projects[p];
                 let run = pr.running_count();
-                let conn = match pr.conn {
-                    Conn::Starting => " …",
-                    Conn::Ready => "",
-                    Conn::Dead => " ✗",
+                let (conn, conn_st) = match pr.conn {
+                    Conn::Starting => (" …", theme::muted()),
+                    Conn::Ready => ("", theme::muted()),
+                    Conn::Dead => (" ✗", theme::err()),
                 };
                 let caret = if pr.collapsed { "▸" } else { "▾" };
-                let badge = if !pr.approvals.is_empty() {
-                    format!(" !{}", pr.approvals.len())
+                let (badge, badge_st) = if !pr.approvals.is_empty() {
+                    (
+                        format!(" ! {} ", pr.approvals.len()),
+                        theme::chip(theme::cur().warn),
+                    )
                 } else if run > 0 {
-                    format!(" ●{run}")
+                    (format!(" ● {run} "), theme::accent_b())
                 } else {
-                    String::new()
+                    (String::new(), Style::default())
                 };
-                let name = truncate(
-                    &pr.name.to_uppercase(),
-                    w.saturating_sub(5 + badge.chars().count()),
+                let name = truncate(&pr.name, w.saturating_sub(6 + badge.chars().count()));
+                lines.push(
+                    Line::from(vec![
+                        Span::styled(format!(" {caret} "), theme::muted()),
+                        Span::styled(
+                            name,
+                            if selected {
+                                theme::accent_b()
+                            } else {
+                                theme::bold()
+                            },
+                        ),
+                        Span::styled(conn, conn_st),
+                        Span::raw(" "),
+                        Span::styled(badge, badge_st),
+                    ])
+                    .style(bg),
                 );
-                let st = if selected { rev() } else { bold() };
-                lines.push(Line::from(vec![
-                    Span::styled(format!(" {caret} {name}{conn}"), st),
-                    Span::styled(badge, if selected { rev() } else { bold() }),
-                ]));
             }
             Row::Session(p, s, depth) => {
                 let pr = &app.projects[p];
@@ -287,75 +407,105 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
                 let pend = pr.approvals.iter().any(|a| a.session_id == se.id);
                 let pad = "  ".repeat(depth + 1);
                 let mark = if pend {
-                    Span::styled("!", rev())
+                    Span::styled(
+                        "!",
+                        theme::warn().add_modifier(ratatui::style::Modifier::BOLD),
+                    )
                 } else if se.unread {
-                    Span::styled("•", bold())
+                    Span::styled("•", theme::accent_b())
                 } else {
                     Span::raw(" ")
                 };
                 let label = truncate(&se.label(), w.saturating_sub(pad.len() + 5));
                 let st = if selected {
-                    rev()
+                    theme::bold()
                 } else if se.status == Status::Running {
-                    Style::default()
+                    theme::text()
                 } else {
-                    dim()
+                    theme::muted()
                 };
-                lines.push(Line::from(vec![
-                    Span::raw(" "),
-                    mark,
-                    Span::raw(pad),
-                    status_glyph(se.status, app.tick),
-                    Span::styled(format!(" {label}"), st),
-                ]));
+                lines.push(
+                    Line::from(vec![
+                        Span::raw(" "),
+                        mark,
+                        Span::raw(pad),
+                        status_glyph(se.status, app.tick),
+                        Span::styled(format!(" {label}"), st),
+                    ])
+                    .style(bg),
+                );
             }
         }
     }
-    f.render_widget(Paragraph::new(lines), inner);
+    let h = parts[1].height as usize;
+    let start = if cursor >= h { cursor + 1 - h } else { 0 };
+    let shown: Vec<Line> = lines.into_iter().skip(start).take(h).collect();
+    f.render_widget(Paragraph::new(shown), parts[1]);
+
+    // footer hints
+    let mut a = vec![Span::raw(" ")];
+    a.extend(hint("Ctrl+P", "commands"));
+    let mut b = vec![Span::raw(" ")];
+    b.extend(hint("Ctrl+T", "themes"));
+    b.push(Span::raw("  "));
+    b.extend(hint("F1", "help"));
+    f.render_widget(
+        Paragraph::new(vec![Line::raw(""), Line::from(a), Line::from(b)]),
+        parts[2],
+    );
 }
 
 fn draw_main(f: &mut Frame, app: &mut App, area: Rect) {
-    let input_lines = app.input_lines(area.width.saturating_sub(4) as usize);
+    let tw = area.width.saturating_sub(7) as usize;
+    let input_lines = app.input_lines(tw);
     let ih = (input_lines.len() as u16).clamp(1, 5);
     let rows = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(3),
-        Constraint::Length(ih + 1),
+        Constraint::Length(ih + 2),
         Constraint::Length(1),
     ])
     .split(area);
 
-    // header
+    // ----- header
     let (cp, cs) = (app.cur_project, app.cur_session);
     let pr = &app.projects[cp];
-    let mut head: Vec<Span> = Vec::new();
+    let mut head: Vec<Span> = vec![Span::raw(" ")];
     if let Some((advisor, slaves)) = app.advisor_models() {
-        head.push(Span::styled(" ADVISOR ", rev()));
-        head.push(Span::styled(format!("{advisor} ▸ {slaves}  "), dim()));
+        head.push(Span::styled(" ADVISOR ", theme::chip(theme::cur().accent2)));
+        head.push(Span::styled(
+            format!(" {advisor} ▸ {slaves}  "),
+            theme::muted(),
+        ));
     }
-    head.push(Span::styled(format!(" {} ", pr.name), bold()));
+    head.push(Span::styled(pr.name.clone(), theme::accent_b()));
     if let Some(si) = cs {
         let se = &pr.sessions[si];
+        head.push(Span::styled("  ›  ", theme::faint()));
+        head.push(Span::styled(truncate(&se.label(), 40), theme::text()));
         head.push(Span::styled(
-            format!("/ {}", truncate(&se.label(), 40)),
-            Style::default(),
+            format!("   turn {} · {}", se.turn, pr.model),
+            theme::muted(),
         ));
-        head.push(Span::styled(
-            format!("   turn {}  ·  {}", se.turn, pr.model),
-            dim(),
-        ));
+        if se.status == Status::Running {
+            head.push(Span::raw("  "));
+            head.push(status_glyph(se.status, app.tick));
+            head.push(Span::styled(" working", theme::accent()));
+        }
         if se.scroll > 0 {
             head.push(Span::styled(
-                format!("   ↑ scrolled {} lines (End to follow)", se.scroll),
-                rev(),
+                format!("   ↑ {} lines up", se.scroll),
+                theme::warn(),
             ));
         }
         if se.dropped > 0 {
             head.push(Span::styled(
-                format!("   {} older items evicted from view", se.dropped),
-                dim(),
+                format!("   {} older items evicted", se.dropped),
+                theme::muted(),
             ));
         }
+    } else {
+        head.push(Span::styled(format!("   {}", pr.model), theme::muted()));
     }
     let bal = balance_header(&app.balance);
     let bw = bal.as_ref().map(|s| s.content.width() as u16).unwrap_or(0);
@@ -373,118 +523,338 @@ fn draw_main(f: &mut Frame, app: &mut App, area: Rect) {
         f.render_widget(Paragraph::new(span), r);
     }
 
-    // transcript
+    // ----- transcript
     let body = rows[1];
-    match cs {
-        None => draw_project_overview(f, &app.projects[cp], body),
-        Some(si) => {
-            let width = body.width.saturating_sub(2);
-            let se = &mut app.projects[cp].sessions[si];
-            let mut cache = std::mem::take(&mut se.cache);
-            cache.sync(se, width);
-            let h = body.height as usize;
-            let total = cache.lines.len();
-            let max_scroll = total.saturating_sub(h);
-            se.scroll = se.scroll.min(max_scroll);
-            let end = total - se.scroll;
-            let start = end.saturating_sub(h);
-            let slice: Vec<Line> = cache.lines[start..end].to_vec();
-            se.cache = cache;
-            let inner = Rect {
-                x: body.x + 1,
-                y: body.y,
-                width: body.width.saturating_sub(1),
-                height: body.height,
+    let empty = cs
+        .map(|si| app.projects[cp].sessions[si].items.is_empty())
+        .unwrap_or(true);
+    if empty {
+        draw_welcome(f, app, body);
+    } else if let Some(si) = cs {
+        let width = body.width.saturating_sub(2);
+        let se = &mut app.projects[cp].sessions[si];
+        let mut cache = std::mem::take(&mut se.cache);
+        cache.sync(se, width);
+        let h = body.height as usize;
+        let total = cache.lines.len();
+        let max_scroll = total.saturating_sub(h);
+        se.scroll = se.scroll.min(max_scroll);
+        let end = total - se.scroll;
+        let start = end.saturating_sub(h);
+        let slice: Vec<Line> = cache.lines[start..end].to_vec();
+        let scrolled = se.scroll;
+        se.cache = cache;
+        let inner = Rect {
+            x: body.x + 1,
+            y: body.y,
+            width: body.width.saturating_sub(1),
+            height: body.height,
+        };
+        f.render_widget(Paragraph::new(slice), inner);
+        if scrolled > 0 && body.width > 24 {
+            let label = " ↓ End to follow ";
+            let lw = label.width() as u16;
+            let r = Rect {
+                x: body.x + body.width - lw - 1,
+                y: body.y + body.height.saturating_sub(1),
+                width: lw,
+                height: 1,
             };
-            f.render_widget(Paragraph::new(slice), inner);
+            f.render_widget(
+                Paragraph::new(Span::styled(label, theme::chip(theme::cur().accent))),
+                r,
+            );
         }
     }
 
-    // input
-    let block = Block::default().borders(Borders::TOP).border_style(dim());
+    // ----- input box
+    let modal_open = app.pending_modal().is_some()
+        || app.help
+        || app.snip.is_some()
+        || app.setup.is_some()
+        || app.palette.is_some()
+        || app.themes.is_some();
+    let running = cs
+        .map(|si| app.projects[cp].sessions[si].status == Status::Running)
+        .unwrap_or(false);
+    let border = if modal_open {
+        theme::faint()
+    } else if !app.input.is_empty() {
+        theme::accent()
+    } else {
+        theme::muted()
+    };
+    let mut title: Vec<Span> = vec![Span::styled(" message ", theme::muted())];
+    if running {
+        title = vec![
+            Span::raw(" "),
+            status_glyph(Status::Running, app.tick),
+            Span::styled(" working — you can queue another prompt ", theme::muted()),
+        ];
+    }
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(border)
+        .title(Line::from(title));
     let inner = block.inner(rows[2]);
     f.render_widget(block, rows[2]);
-    let shown: Vec<Line> = input_lines
-        .iter()
-        .take(ih as usize)
-        .enumerate()
-        .map(|(i, l)| {
-            Line::from(vec![
-                Span::styled(if i == 0 { " › " } else { "   " }, bold()),
-                Span::raw(l.clone()),
-            ])
-        })
-        .collect();
+    let shown: Vec<Line> = if app.input.is_empty() {
+        vec![Line::from(vec![
+            Span::styled(" › ", theme::accent_b()),
+            Span::styled("Ask anything…   (type / for commands)", theme::muted()),
+        ])]
+    } else {
+        input_lines
+            .iter()
+            .take(ih as usize)
+            .enumerate()
+            .map(|(i, l)| {
+                Line::from(vec![
+                    Span::styled(if i == 0 { " › " } else { "   " }, theme::accent_b()),
+                    Span::styled(l.clone(), theme::text()),
+                ])
+            })
+            .collect()
+    };
     f.render_widget(Paragraph::new(shown), inner);
-    let (cx, cy) = app.cursor_xy(area.width.saturating_sub(4) as usize);
-    if app.pending_modal().is_none() && !app.help {
+    let (cx, cy) = app.cursor_xy(tw);
+    if !modal_open {
         f.set_cursor_position((inner.x + 3 + cx as u16, inner.y + (cy as u16).min(ih - 1)));
     }
 
-    // hint
-    let hint = " Enter send · Alt+↑↓ switch · Alt+A advisor · Alt+O open workspace · Ctrl+S snippets · F1 help · Ctrl+Q quit";
-    let line = match &app.flash {
-        Some((m, _)) => Span::styled(format!(" {m}"), bold()),
-        None => Span::styled(hint, dim()),
-    };
-    f.render_widget(Paragraph::new(line), rows[3]);
+    // slash-command suggestions float above the input
+    let matches = app.slash_matches();
+    if !matches.is_empty() && !modal_open {
+        draw_slash_popup(f, app, &matches, rows[2], area);
+    }
+
+    // ----- footer
+    let tag_w = format!("◐ {} ", theme::cur().name).width();
+    let mut foot: Vec<Span> = vec![Span::raw(" ")];
+    if let Some((m, _)) = &app.flash {
+        foot.push(Span::styled("● ", theme::accent()));
+        foot.push(Span::styled(m.clone(), theme::bold()));
+    } else if app.pending_modal().is_some() {
+        foot.extend(hint("y", "allow once"));
+        foot.push(Span::raw("   "));
+        foot.extend(hint("n", "reject"));
+        foot.push(Span::raw("   "));
+        foot.extend(hint("Esc", "decide later"));
+    } else {
+        let mut budget = (area.width as usize).saturating_sub(tag_w + 3);
+        let hints: [(&str, &str); 6] = [
+            ("Enter", "send"),
+            ("Alt+Enter", "newline"),
+            ("Alt+↑↓", "switch"),
+            ("Ctrl+P", "commands"),
+            ("Ctrl+T", "themes"),
+            ("F1", "help"),
+        ];
+        for (kk, l) in hints {
+            let need = kk.width() + l.width() + 4;
+            if need > budget {
+                break;
+            }
+            budget -= need;
+            foot.extend(hint(kk, l));
+            foot.push(Span::raw("   "));
+        }
+    }
+    let tag = format!("◐ {} ", theme::cur().name);
+    let tagw = tag.width() as u16;
+    if area.width > tagw + 30 {
+        let r = Rect {
+            x: rows[3].x + rows[3].width - tagw,
+            width: tagw,
+            ..rows[3]
+        };
+        let left = Rect {
+            width: rows[3].width - tagw,
+            ..rows[3]
+        };
+        f.render_widget(Paragraph::new(Line::from(foot)), left);
+        f.render_widget(Paragraph::new(Span::styled(tag, theme::muted())), r);
+    } else {
+        f.render_widget(Paragraph::new(Line::from(foot)), rows[3]);
+    }
 }
 
-fn draw_project_overview(f: &mut Frame, pr: &Project, area: Rect) {
-    let mut l = vec![
-        Line::raw(""),
-        Line::styled(format!("  {}", pr.name.to_uppercase()), bold()),
-        Line::styled(format!("  {}", pr.cwd), dim()),
-        Line::styled(
-            format!(
-                "  model {}  ·  {} sessions  ·  {} running",
-                pr.model,
-                pr.sessions.len(),
-                pr.running_count()
-            ),
-            dim(),
-        ),
-        Line::raw(""),
-        Line::raw("  No session selected. Type a prompt to start one in this project."),
-        Line::raw(""),
-    ];
-    for s in pr
-        .log
+fn draw_slash_popup(f: &mut Frame, app: &App, matches: &[&'static Cmd], input: Rect, area: Rect) {
+    let n = matches.len().min(8) as u16;
+    let w = 64.min(area.width.saturating_sub(2)).max(24);
+    let h = n + 2;
+    if input.y < area.y + h {
+        return;
+    }
+    let r = Rect {
+        x: input.x + 1,
+        y: input.y - h,
+        width: w.min(input.width.saturating_sub(2)),
+        height: h,
+    };
+    f.render_widget(Clear, r);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(theme::accent())
+        .style(theme::surface());
+    let inner = block.inner(r);
+    f.render_widget(block, r);
+    let sel = app.slash_sel.min(matches.len() - 1);
+    let start = sel.saturating_sub(n as usize - 1);
+    let lines: Vec<Line> = matches
         .iter()
-        .rev()
-        .take(8)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-    {
-        l.push(Line::styled(
-            format!(
-                "  runtime: {}",
-                truncate(s, area.width.saturating_sub(14) as usize)
-            ),
-            dim(),
-        ));
+        .enumerate()
+        .skip(start)
+        .take(n as usize)
+        .map(|(i, c)| cmd_line(c, inner.width as usize, i == sel))
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// One command row: name, description, shortcut right-aligned.
+fn cmd_line(c: &Cmd, w: usize, selected: bool) -> Line<'static> {
+    let bg = if selected {
+        theme::sel()
+    } else {
+        Style::default()
+    };
+    let name = format!(" {:<10}", c.name);
+    let keys = if c.keys.is_empty() {
+        String::new()
+    } else {
+        format!(" {} ", c.keys)
+    };
+    let room = w.saturating_sub(name.width() + keys.width() + 2);
+    let desc = truncate(c.desc, room);
+    let gap = w.saturating_sub(name.width() + desc.width() + keys.width());
+    Line::from(vec![
+        Span::styled(
+            name,
+            if selected {
+                theme::accent_b()
+            } else {
+                theme::accent()
+            },
+        ),
+        Span::styled(
+            desc,
+            if selected {
+                theme::text()
+            } else {
+                theme::muted()
+            },
+        ),
+        Span::raw(" ".repeat(gap)),
+        Span::styled(
+            keys,
+            theme::faint().patch(if selected {
+                theme::muted()
+            } else {
+                Style::default()
+            }),
+        ),
+    ])
+    .style(bg)
+}
+
+fn draw_welcome(f: &mut Frame, app: &App, area: Rect) {
+    let pr: &Project = &app.projects[app.cur_project];
+    let lw = 56usize;
+    let pad = " ".repeat((area.width as usize).saturating_sub(lw) / 2);
+    let t = theme::cur();
+    let mut l: Vec<Line> = vec![Line::raw("")];
+    if area.height >= 20 {
+        l.push(Line::raw(""));
+    }
+    for row in LOGO {
+        let n = row.chars().count().max(1);
+        let mut spans = vec![Span::raw(pad.clone())];
+        for (i, ch) in row.chars().enumerate() {
+            let c = theme::lerp(t.accent, t.accent2, i as f32 / (n - 1) as f32);
+            spans.push(Span::styled(ch.to_string(), Style::new().fg(c)));
+        }
+        l.push(Line::from(spans));
+    }
+    l.push(Line::from(vec![
+        Span::raw(pad.clone()),
+        Span::styled("the agent harness for your terminal", theme::muted()),
+    ]));
+    l.push(Line::raw(""));
+    let info = |label: &str, value: String| {
+        Line::from(vec![
+            Span::raw(pad.clone()),
+            Span::styled(format!("{label:<10}"), theme::muted()),
+            Span::styled(truncate(&value, lw.saturating_sub(10)), theme::text()),
+        ])
+    };
+    l.push(info("workspace", pr.name.clone()));
+    l.push(info("path", pr.cwd.clone()));
+    l.push(info("model", pr.model.clone()));
+    l.push(Line::raw(""));
+    let mut sec = section("GET STARTED", lw);
+    sec.spans.insert(0, Span::raw(pad.clone()));
+    l.push(sec);
+    let tips: [(&str, &str); 6] = [
+        ("Enter", "type a prompt and send it to the agent"),
+        ("/", "slash commands — Tab completes"),
+        ("Ctrl+P", "command palette: search everything"),
+        ("Ctrl+T", "pick a colour theme (live preview)"),
+        ("Alt+A", "advisor mode: planner + parallel workers"),
+        ("Alt+O", "open another workspace folder"),
+    ];
+    for (key, desc) in tips {
+        l.push(Line::from(vec![
+            Span::raw(pad.clone()),
+            Span::styled(format!(" {key:<8}"), theme::accent_b()),
+            Span::styled(desc, theme::text()),
+        ]));
+    }
+    if !pr.log.is_empty() {
+        l.push(Line::raw(""));
+        for s in pr
+            .log
+            .iter()
+            .rev()
+            .take(4)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+        {
+            l.push(Line::from(vec![
+                Span::raw(pad.clone()),
+                Span::styled(
+                    format!(
+                        " runtime  {}",
+                        truncate(s, area.width.saturating_sub(18) as usize)
+                    ),
+                    theme::muted(),
+                ),
+            ]));
+        }
     }
     f.render_widget(Paragraph::new(l), area);
 }
 
 fn draw_right(f: &mut Frame, app: &App, area: Rect) {
-    let block = Block::default().borders(Borders::LEFT).border_style(dim());
+    let block = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(theme::faint())
+        .style(theme::surface());
     let inner = block.inner(area);
     f.render_widget(block, area);
     let pr = &app.projects[app.cur_project];
     let w = inner.width as usize;
     let mut l: Vec<Line> = vec![Line::raw("")];
     let Some(si) = app.cur_session else {
-        l.push(Line::styled(" RUNTIME", bold()));
-        l.push(Line::styled(
-            match pr.conn {
-                Conn::Starting => " starting…",
-                Conn::Ready => " ready",
-                Conn::Dead => " not running",
-            },
-            dim(),
-        ));
+        l.push(section("RUNTIME", w));
+        let (txt, st) = match pr.conn {
+            Conn::Starting => ("◌ starting…", theme::muted()),
+            Conn::Ready => ("● ready", theme::ok()),
+            Conn::Dead => ("✗ not running", theme::err()),
+        };
+        l.push(Line::styled(format!(" {txt}"), st));
+        l.push(Line::raw(""));
+        l.extend(balance_lines(&app.balance));
         f.render_widget(Paragraph::new(l), inner);
         return;
     };
@@ -508,82 +878,88 @@ fn draw_right(f: &mut Frame, app: &App, area: Rect) {
             .iter()
             .filter(|&&c| pr.sessions[c].status != Status::Running)
             .count();
-        l.push(Line::styled(" ┏━ ADVISOR ━━━━━━━━━━━━━", bold()));
+        l.push(section("ADVISOR", w));
         l.push(Line::from(vec![
-            Span::styled(" ┃ ", dim()),
-            Span::styled("plans  ", dim()),
-            Span::styled(truncate(advisor, w.saturating_sub(10)), bold()),
+            Span::styled(" plans   ", theme::muted()),
+            Span::styled(truncate(advisor, w.saturating_sub(10)), theme::accent_b()),
         ]));
         l.push(Line::from(vec![
-            Span::styled(" ┃ ", dim()),
-            Span::styled("slaves ", dim()),
-            Span::styled(truncate(slaves, w.saturating_sub(10)), bold()),
+            Span::styled(" workers ", theme::muted()),
+            Span::styled(truncate(slaves, w.saturating_sub(10)), theme::accent2()),
         ]));
         l.push(Line::styled(
-            format!(" ┃ {}/{} workers reported", reported, kids.len()),
-            dim(),
+            format!(" {}/{} workers reported", reported, kids.len()),
+            theme::muted(),
         ));
-        l.push(Line::styled(" ┗━━━━━━━━━━━━━━━━━━━━━", bold()));
         l.push(Line::raw(""));
     }
-    l.push(Line::from(vec![
-        Span::styled(" AGENTS", bold()),
-        Span::styled(
-            format!(
-                "   {} running / {}",
-                run + (pr.sessions[root].status == Status::Running) as usize,
-                kids.len() + 1
-            ),
-            dim(),
+    l.push(section("AGENTS", w));
+    l.push(Line::styled(
+        format!(
+            " {} running / {} total",
+            run + (pr.sessions[root].status == Status::Running) as usize,
+            kids.len() + 1
         ),
-    ]));
-    let mut push_agent = |s: &Session, name: &str, sel: bool| {
-        let st = if sel { rev() } else { Style::default() };
-        l.push(Line::from(vec![
-            Span::raw(" "),
-            status_glyph(s.status, app.tick),
-            Span::styled(format!(" {}", truncate(name, w.saturating_sub(4))), st),
-        ]));
-        if let Some(t) = &s.last_tool {
-            if s.status == Status::Running {
-                l.push(Line::styled(
-                    format!("   ▸ {}", truncate(t, w.saturating_sub(6))),
-                    dim(),
-                ));
-            }
+        theme::muted(),
+    ));
+    let mut push_agent = |s: &Session, name: &str, sel: bool, tree: &str| {
+        let bg = if sel { theme::sel() } else { Style::default() };
+        l.push(
+            Line::from(vec![
+                Span::styled(format!(" {tree}"), theme::faint()),
+                status_glyph(s.status, app.tick),
+                Span::styled(
+                    format!(" {}", truncate(name, w.saturating_sub(7))),
+                    if sel { theme::bold() } else { theme::text() },
+                ),
+            ])
+            .style(bg),
+        );
+        if let Some(t) = &s.last_tool
+            && s.status == Status::Running
+        {
+            l.push(Line::styled(
+                format!("     ▸ {}", truncate(t, w.saturating_sub(8))),
+                theme::muted(),
+            ));
         }
     };
-    push_agent(&pr.sessions[root], "main", root == si);
-    for &c in &kids {
+    push_agent(&pr.sessions[root], "main", root == si, "");
+    let nk = kids.len();
+    for (i, &c) in kids.iter().enumerate() {
         let name = pr.sessions[c].label();
-        push_agent(&pr.sessions[c], &name, c == si);
+        push_agent(
+            &pr.sessions[c],
+            &name,
+            c == si,
+            if i + 1 == nk { "└ " } else { "├ " },
+        );
     }
     l.push(Line::raw(""));
 
     let se = &pr.sessions[si];
-    l.push(Line::styled(" CONTEXT", bold()));
+    l.push(section("CONTEXT", w));
     match se.ctx_ratio() {
         Some(r) => {
-            l.push(Line::from(vec![
-                Span::raw(" "),
-                Span::styled(
-                    gauge(r, w.saturating_sub(8)),
-                    if r > 0.85 { rev() } else { Style::default() },
-                ),
-                Span::raw(format!(" {:>3}%", (r * 100.0).round() as u32)),
-            ]));
+            let mut g = vec![Span::raw(" ")];
+            g.extend(gauge(r, w.saturating_sub(8)));
+            g.push(Span::styled(
+                format!(" {:>3}%", (r * 100.0).round() as u32),
+                theme::bold(),
+            ));
+            l.push(Line::from(g));
             l.push(Line::styled(
                 format!(
-                    " {} / {}",
+                    " {} / {} tokens",
                     k(se.usage.last_context),
                     k(se.context_window.unwrap_or(0))
                 ),
-                dim(),
+                theme::muted(),
             ));
         }
         None => l.push(Line::styled(
             format!(" {} tokens", k(se.usage.last_context)),
-            dim(),
+            theme::muted(),
         )),
     }
     l.push(Line::raw(""));
@@ -593,28 +969,25 @@ fn draw_right(f: &mut Frame, app: &App, area: Rect) {
         to += s.usage.output;
         tc += s.usage.cache_read;
     }
-    l.push(Line::styled(" TOKENS (tree)", bold()));
-    l.push(Line::raw(format!(" in     {:>8}", k(ti))));
-    l.push(Line::raw(format!(" out    {:>8}", k(to))));
-    l.push(Line::raw(format!(" cached {:>8}", k(tc))));
-    if ti + tc > 0 {
-        l.push(Line::styled(
-            format!(" hit    {:>7}%", tc * 100 / (ti + tc)),
-            dim(),
-        ));
+    l.push(section("TOKENS", w));
+    let row = |label: &str, v: u64| {
+        Line::from(vec![
+            Span::styled(format!(" {label:<8}"), theme::muted()),
+            Span::styled(format!("{:>8}", k(v)), theme::text()),
+        ])
+    };
+    l.push(row("input", ti));
+    l.push(row("output", to));
+    l.push(row("cached", tc));
+    if let Some(pct) = (tc * 100).checked_div(ti + tc) {
+        l.push(Line::from(vec![
+            Span::styled(" hit rate", theme::muted()),
+            Span::styled(format!("{:>6}%", pct), theme::ok()),
+        ]));
     }
     l.push(Line::raw(""));
     l.extend(balance_lines(&app.balance));
     f.render_widget(Paragraph::new(l), inner);
-}
-
-fn centered(area: Rect, w: u16, h: u16) -> Rect {
-    Rect {
-        x: area.x + area.width.saturating_sub(w) / 2,
-        y: area.y + area.height.saturating_sub(h) / 2,
-        width: w.min(area.width),
-        height: h.min(area.height),
-    }
 }
 
 fn draw_advisor_setup(f: &mut Frame, app: &App, area: Rect) {
@@ -622,56 +995,75 @@ fn draw_advisor_setup(f: &mut Frame, app: &App, area: Rect) {
     let Some(setup) = &app.setup else {
         return;
     };
-    let r = centered(area, 78, 14);
-    f.render_widget(Clear, r);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Double)
-        .title(" ADVISOR MODE ")
-        .title_alignment(ratatui::layout::Alignment::Center);
-    let inner = block.inner(r);
-    f.render_widget(block, r);
-
+    let inner = modal(
+        f,
+        area,
+        76,
+        15,
+        chip_title("ADVISOR MODE", theme::cur().accent2),
+        theme::accent2(),
+    );
     let mut lines: Vec<Line> = vec![
-        Line::styled(
-            " advisor plans and judges · subagents execute · advisor synthesises",
-            dim(),
-        ),
         Line::raw(""),
         Line::styled(
-            "   task ──▶ advisor ──▶ workers ──▶ advisor ──▶ result",
-            bold(),
+            "The advisor plans and judges. Workers execute in parallel.",
+            theme::muted(),
         ),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("  task ", theme::muted()),
+            Span::styled("──▶ ", theme::faint()),
+            Span::styled("advisor ", theme::accent_b()),
+            Span::styled("──▶ ", theme::faint()),
+            Span::styled("workers ", theme::accent2()),
+            Span::styled("──▶ ", theme::faint()),
+            Span::styled("advisor ", theme::accent_b()),
+            Span::styled("──▶ ", theme::faint()),
+            Span::styled("result", theme::ok()),
+        ]),
         Line::raw(""),
     ];
-    let labels = ["advisor model", "slave models "];
+    let labels = ["advisor model", "worker models"];
     for (i, label) in labels.iter().enumerate() {
         let focused = setup.focus == i;
         let value = &setup.models[i];
         let mut spans = vec![
-            Span::styled(format!(" {label} "), if focused { rev() } else { dim() }),
+            Span::styled(
+                format!(" {label} "),
+                if focused {
+                    theme::chip(theme::cur().accent)
+                } else {
+                    theme::muted()
+                },
+            ),
             Span::raw("  "),
+            Span::styled(
+                format!(" {value}"),
+                if focused {
+                    theme::bold()
+                } else {
+                    theme::text()
+                },
+            ),
         ];
         if focused {
-            spans.push(Span::styled(
-                format!(" {value} "),
-                Style::default().add_modifier(Modifier::REVERSED),
-            ));
-            spans.push(Span::styled("▏", bold()));
-        } else {
-            spans.push(Span::styled(format!(" {value} "), bold()));
+            spans.push(Span::styled("▏", theme::accent_b()));
         }
         lines.push(Line::from(spans));
         lines.push(Line::raw(""));
     }
-    lines.push(Line::styled(
-        format!(" suggestions: {}", MODEL_SUGGESTIONS.join(" · ")),
-        dim(),
-    ));
-    lines.push(Line::styled(
-        " Tab switch field · type to replace · Enter start · Esc back to normal",
-        dim(),
-    ));
+    lines.push(Line::from(vec![
+        Span::styled(" suggestions  ", theme::muted()),
+        Span::styled(MODEL_SUGGESTIONS.join("  ·  "), theme::text()),
+    ]));
+    lines.push(Line::raw(""));
+    let mut h = vec![Span::raw(" ")];
+    h.extend(hint("Tab", "switch field"));
+    h.push(Span::raw("   "));
+    h.extend(hint("Enter", "start"));
+    h.push(Span::raw("   "));
+    h.extend(hint("Esc", "cancel"));
+    lines.push(Line::from(h));
     f.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -682,130 +1074,263 @@ fn draw_approval(f: &mut Frame, app: &App, (p, a): (usize, usize), area: Rect) {
         .get(&ap.session_id)
         .map(|&i| app.projects[p].sessions[i].label())
         .unwrap_or_default();
-    let r = centered(area, 64, 9);
-    f.render_widget(Clear, r);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(" APPROVAL ", rev()));
-    let inner = block.inner(r);
-    f.render_widget(block, r);
+    let inner = modal(
+        f,
+        area,
+        68,
+        11,
+        chip_title("⚠ APPROVAL NEEDED", theme::cur().warn),
+        theme::warn(),
+    );
     let mut l = vec![
+        Line::raw(""),
         Line::from(vec![
-            Span::styled(format!(" {} ", app.projects[p].name), bold()),
-            Span::styled(format!("/ agent {who}"), dim()),
+            Span::styled(app.projects[p].name.clone(), theme::accent_b()),
+            Span::styled("  ›  ", theme::faint()),
+            Span::styled(format!("agent {who}"), theme::muted()),
         ]),
         Line::raw(""),
         Line::from(vec![
-            Span::raw(" tool   "),
-            Span::styled(ap.tool.clone(), bold()),
+            Span::styled("wants to run  ", theme::muted()),
+            Span::styled(
+                ap.tool.clone(),
+                theme::accent2().add_modifier(ratatui::style::Modifier::BOLD),
+            ),
         ]),
     ];
     for (i, line) in wrap(
         ap.reason.as_deref().unwrap_or("(no reason given)"),
-        inner.width as usize - 10,
+        (inner.width as usize).saturating_sub(10),
     )
     .into_iter()
     .take(2)
     .enumerate()
     {
-        l.push(Line::raw(format!(
-            " {} {}",
-            if i == 0 { "reason " } else { "       " },
-            line
-        )));
+        l.push(Line::from(vec![
+            Span::styled(
+                if i == 0 {
+                    "because       "
+                } else {
+                    "              "
+                },
+                theme::muted(),
+            ),
+            Span::styled(line, theme::text()),
+        ]));
     }
     l.push(Line::raw(""));
-    l.push(Line::styled(
-        " [y] allow once    [n] reject    [Esc] decide later",
-        bold(),
-    ));
+    l.push(Line::from(vec![
+        Span::styled(" y  Allow once ", theme::chip(theme::cur().ok)),
+        Span::raw("   "),
+        Span::styled(" n  Reject ", theme::chip(theme::cur().err)),
+        Span::raw("   "),
+        Span::styled("Esc  decide later", theme::muted()),
+    ]));
     f.render_widget(Paragraph::new(l), inner);
 }
 
 fn draw_help(f: &mut Frame, area: Rect) {
-    let r = centered(area, 72, 25);
-    f.render_widget(Clear, r);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(" KEYS ", rev()));
-    let inner = block.inner(r);
-    f.render_widget(block, r);
-    let rows = [
-        ("Enter", "send prompt (slash commands go to the harness)"),
-        ("Alt+Enter", "newline in prompt"),
-        ("Alt+↑ / Alt+↓", "previous / next project or session"),
-        ("Alt+1..9", "jump to project"),
-        ("Alt+N", "new session in current project"),
-        (
-            "Alt+A  /advisor",
-            "advisor mode: pick planner + worker models, then delegate",
-        ),
-        ("/normal", "leave advisor mode"),
-        (
-            "/open <path>",
-            "add a workspace (Alt+O prefills, Tab completes dirs)",
-        ),
-        ("/close", "close current workspace and stop its runtime"),
-        (
-            "Ctrl+S",
-            "snippet viewer: browse, pan, copy code from this session",
-        ),
-        ("Ctrl+Y", "copy the newest snippet"),
-        ("PgUp / PgDn / End", "scroll transcript / follow tail"),
-        ("Ctrl+B / Ctrl+G", "toggle sidebar / agents panel"),
-        ("Ctrl+A", "reopen pending approval"),
-        (
-            "Ctrl+K",
-            "abort runtime of current project (SDK has no cancel)",
-        ),
-        ("Ctrl+U / Ctrl+W", "clear prompt / delete word"),
-        ("F1", "this help"),
-        ("Ctrl+Q", "quit"),
+    let wide = area.width >= 104;
+    let (w, h) = if wide { (100, 22) } else { (66, 40) };
+    let inner = modal(
+        f,
+        area,
+        w,
+        h,
+        chip_title("KEYS", theme::cur().accent),
+        theme::accent(),
+    );
+    let key = |a: &str, b: &str| {
+        Line::from(vec![
+            Span::styled(format!(" {a:<17}"), theme::accent_b()),
+            Span::styled(b.to_string(), theme::text()),
+        ])
+    };
+    let sec = |t: &str, w: usize| section(t, w);
+    let half = if wide {
+        inner.width as usize / 2 - 1
+    } else {
+        inner.width as usize
+    };
+    let mut left: Vec<Line> = vec![
+        sec("NAVIGATE", half),
+        key("Alt+↑ / Alt+↓", "previous / next workspace or session"),
+        key("Alt+1 … Alt+9", "jump to workspace"),
+        key("Alt+N", "new session in this workspace"),
+        key("PgUp / PgDn", "scroll the transcript"),
+        key("↑ / ↓", "scroll too (when the prompt is empty)"),
+        key("End", "jump to the newest message"),
+        Line::raw(""),
+        sec("PROMPT", half),
+        key("Enter", "send (slash commands run locally)"),
+        key("Alt+Enter", "newline"),
+        key("/", "command suggestions · Tab completes"),
+        key("Ctrl+U / Ctrl+W", "clear prompt / delete word"),
     ];
-    let mut l: Vec<Line> = rows
-        .iter()
-        .map(|(a, b)| {
-            Line::from(vec![
-                Span::styled(format!(" {a:<20}"), bold()),
-                Span::raw(b.to_string()),
-            ])
-        })
-        .collect();
+    let mut right: Vec<Line> = vec![
+        sec("WORKSPACE", half),
+        key("Ctrl+P", "command palette — search everything"),
+        key("Ctrl+T", "colour themes with live preview"),
+        key("Alt+O  /open", "add a workspace (Tab completes dirs)"),
+        key("/close", "close the workspace"),
+        key("Alt+A  /advisor", "planner + workers · /normal leaves"),
+        key("Ctrl+K", "abort this workspace's runtime"),
+        Line::raw(""),
+        sec("PANELS", half),
+        key("Ctrl+S", "snippet viewer (browse, pan, copy)"),
+        key("Ctrl+Y", "copy the newest snippet"),
+        key("Ctrl+B / Ctrl+G", "toggle sidebar / agents panel"),
+        key("Ctrl+A", "reopen a pending approval"),
+        key("F1  ·  Ctrl+Q", "this help  ·  quit"),
+    ];
+    let legend = Line::from(vec![
+        Span::styled(" ⠋", theme::accent_b()),
+        Span::styled(" running   ", theme::muted()),
+        Span::styled("○", theme::muted()),
+        Span::styled(" idle   ", theme::muted()),
+        Span::styled("✗", theme::err()),
+        Span::styled(" failed   ", theme::muted()),
+        Span::styled("!", theme::warn()),
+        Span::styled(" needs you   ", theme::muted()),
+        Span::styled("•", theme::accent_b()),
+        Span::styled(" unread", theme::muted()),
+    ]);
+    if wide {
+        let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(inner);
+        let cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(rows[0]);
+        f.render_widget(Paragraph::new(left), cols[0]);
+        f.render_widget(Paragraph::new(right), cols[1]);
+        f.render_widget(Paragraph::new(vec![Line::raw(""), legend]), rows[1]);
+    } else {
+        left.push(Line::raw(""));
+        left.append(&mut right);
+        left.push(Line::raw(""));
+        left.push(legend);
+        f.render_widget(Paragraph::new(left), inner);
+    }
+}
+
+fn draw_palette(f: &mut Frame, app: &App, area: Rect) {
+    let Some(p) = &app.palette else { return };
+    let matches = app.palette_matches();
+    let n = matches.len().clamp(1, 12) as u16;
+    let inner = modal(
+        f,
+        area,
+        70,
+        n + 6,
+        chip_title("COMMANDS", theme::cur().accent),
+        theme::accent(),
+    );
+    let mut l: Vec<Line> = vec![
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled(" › ", theme::accent_b()),
+            Span::styled(p.query.clone(), theme::bold()),
+            Span::styled("▏", theme::accent_b()),
+        ]),
+        section("", inner.width as usize),
+    ];
+    if matches.is_empty() {
+        l.push(Line::styled(" no command matches", theme::muted()));
+    }
+    let sel = p.sel.min(matches.len().saturating_sub(1));
+    let start = sel.saturating_sub(n as usize - 1);
+    for (i, c) in matches.iter().enumerate().skip(start).take(n as usize) {
+        l.push(cmd_line(c, inner.width as usize, i == sel));
+    }
     l.push(Line::raw(""));
-    l.push(Line::styled(
-        " ● running  ○ idle  ✗ failed  ! needs you  • unread",
-        dim(),
-    ));
+    let mut h = vec![Span::raw(" ")];
+    h.extend(hint("↑↓", "select"));
+    h.push(Span::raw("   "));
+    h.extend(hint("Enter", "run"));
+    h.push(Span::raw("   "));
+    h.extend(hint("Esc", "close"));
+    l.push(Line::from(h));
+    f.render_widget(Paragraph::new(l), inner);
+}
+
+fn draw_theme_picker(f: &mut Frame, app: &App, area: Rect) {
+    let Some(tp) = &app.themes else { return };
+    let inner = modal(
+        f,
+        area,
+        50,
+        THEMES.len() as u16 + 6,
+        chip_title("THEMES", theme::cur().accent),
+        theme::accent(),
+    );
+    let mut l: Vec<Line> = vec![Line::raw("")];
+    for (i, t) in THEMES.iter().enumerate() {
+        let sel = i == tp.sel;
+        let bg = if sel { theme::sel() } else { Style::default() };
+        let sw = |c: Color| Span::styled("██", Style::new().fg(c));
+        l.push(
+            Line::from(vec![
+                Span::styled(if sel { " ▸ " } else { "   " }, theme::accent_b()),
+                Span::styled(
+                    format!("{:<13}", t.name),
+                    if sel { theme::bold() } else { theme::text() },
+                ),
+                sw(t.accent),
+                sw(t.accent2),
+                sw(t.ok),
+                sw(t.warn),
+                sw(t.err),
+                Span::styled(
+                    if i == tp.original {
+                        "  ✓ current"
+                    } else {
+                        ""
+                    },
+                    theme::muted(),
+                ),
+            ])
+            .style(bg),
+        );
+    }
+    l.push(Line::raw(""));
+    let mut h = vec![Span::raw(" ")];
+    h.extend(hint("↑↓", "preview"));
+    h.push(Span::raw("   "));
+    h.extend(hint("Enter", "apply & save"));
+    h.push(Span::raw("   "));
+    h.extend(hint("Esc", "cancel"));
+    l.push(Line::from(h));
     f.render_widget(Paragraph::new(l), inner);
 }
 
 fn balance_header(b: &Balance) -> Option<Span<'static>> {
     match b {
         Balance::Unsupported => None,
-        Balance::NoKey => Some(Span::styled(" balance: no API key ", dim())),
-        Balance::Loading => Some(Span::styled(" balance … ", dim())),
+        Balance::NoKey => Some(Span::styled(" balance: no API key ", theme::muted())),
+        Balance::Loading => Some(Span::styled(" balance … ", theme::muted())),
         _ => match b.short() {
-            Some(s) if b.is_low() => Some(Span::styled(format!(" {s} LOW "), rev())),
-            Some(s) => Some(Span::styled(format!(" {s} "), bold())),
-            None => Some(Span::styled(" balance ✗ ", dim())),
+            Some(s) if b.is_low() => Some(Span::styled(
+                format!(" {s} LOW "),
+                theme::chip(theme::cur().err),
+            )),
+            Some(s) => Some(Span::styled(format!(" {s} "), theme::ok())),
+            None => Some(Span::styled(" balance ✗ ", theme::muted())),
         },
     }
 }
 
 fn balance_lines(b: &Balance) -> Vec<Line<'static>> {
-    let mut l = vec![Line::styled(" BALANCE", bold())];
+    let mut l = vec![section("BALANCE", 32)];
     let (info, at, err) = match b {
         Balance::Unsupported => {
-            l.push(Line::styled(" n/a for this provider", dim()));
+            l.push(Line::styled(" n/a for this provider", theme::muted()));
             return l;
         }
         Balance::NoKey => {
-            l.push(Line::styled(" set DEEPSEEK_API_KEY", dim()));
-            l.push(Line::styled(" (env or .env) to show it", dim()));
+            l.push(Line::styled(" set DEEPSEEK_API_KEY", theme::muted()));
+            l.push(Line::styled(" (env or .env) to show it", theme::muted()));
             return l;
         }
         Balance::Loading => {
-            l.push(Line::styled(" loading…", dim()));
+            l.push(Line::styled(" loading…", theme::muted()));
             return l;
         }
         Balance::Ok { info, at } => (Some(info), Some(*at), None),
@@ -819,46 +1344,54 @@ fn balance_lines(b: &Balance) -> Vec<Line<'static>> {
         for w in &info.wallets {
             let sym = Balance::sym(&w.currency);
             l.push(Line::from(vec![
-                Span::raw(format!(" {} ", w.currency)),
+                Span::styled(format!(" {} ", w.currency), theme::muted()),
                 Span::styled(
                     format!("{sym}{}", w.total),
-                    if b.is_low() { rev() } else { bold() },
+                    if b.is_low() {
+                        theme::err().add_modifier(ratatui::style::Modifier::BOLD)
+                    } else {
+                        theme::ok().add_modifier(ratatui::style::Modifier::BOLD)
+                    },
                 ),
             ]));
             l.push(Line::styled(
                 format!("   topped up {sym}{}", w.topped_up),
-                dim(),
+                theme::muted(),
             ));
             l.push(Line::styled(
                 format!("   granted   {sym}{}", w.granted),
-                dim(),
+                theme::muted(),
             ));
         }
         if !info.available {
-            l.push(Line::styled(" account not available", rev()));
+            l.push(Line::styled(" account not available", theme::err()));
         }
     }
     if let Some(at) = at {
         l.push(Line::styled(
             format!(" updated {}s ago", at.elapsed().as_secs()),
-            dim(),
+            theme::faint(),
         ));
     }
     if let Some(e) = err {
-        l.push(Line::styled(format!(" ✗ {}", truncate(&e, 28)), rev()));
+        l.push(Line::styled(
+            format!(" ✗ {}", truncate(&e, 28)),
+            theme::err(),
+        ));
     }
     l
 }
 
 fn draw_snippets(f: &mut Frame, app: &mut App, area: Rect) {
-    let r = area;
-    f.render_widget(Clear, r);
+    f.render_widget(Clear, area);
     let n = app.cur_snippets().len();
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(format!(" SNIPPETS · {n} "), rev()));
-    let inner = block.inner(r);
-    f.render_widget(block, r);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(theme::accent())
+        .title(chip_title(&format!("SNIPPETS · {n}"), theme::cur().accent))
+        .style(theme::surface());
+    let inner = block.inner(area);
+    f.render_widget(block, area);
     let cols = Layout::horizontal([Constraint::Length(34), Constraint::Min(20)]).split(inner);
     let rows = Layout::vertical([Constraint::Min(2), Constraint::Length(1)]).split(cols[1]);
     let list_h = cols[0].height as usize;
@@ -895,20 +1428,39 @@ fn draw_snippets(f: &mut Frame, app: &mut App, area: Rect) {
         .skip(start)
         .take(list_h)
     {
-        let label = truncate(&s.title, 20);
+        let label = truncate(&s.title, 18);
         let meta = format!(
             "{} · {}L",
             if s.lang.is_empty() { "text" } else { &s.lang },
             s.code.split('\n').count()
         );
-        let text = format!(" {label:<20} {}", truncate(&meta, 11));
-        list.push(Line::styled(
-            truncate(&text, cols[0].width as usize - 1),
-            if i == sel { rev() } else { Style::default() },
-        ));
+        let selected = i == sel;
+        list.push(
+            Line::from(vec![
+                Span::styled(if selected { " ▸ " } else { "   " }, theme::accent_b()),
+                Span::styled(
+                    format!("{label:<18}"),
+                    if selected {
+                        theme::bold()
+                    } else {
+                        theme::text()
+                    },
+                ),
+                Span::styled(format!(" {}", truncate(&meta, 11)), theme::muted()),
+            ])
+            .style(if selected {
+                theme::sel()
+            } else {
+                Style::default()
+            }),
+        );
     }
     f.render_widget(
-        Paragraph::new(list).block(Block::default().borders(Borders::RIGHT).border_style(dim())),
+        Paragraph::new(list).block(
+            Block::default()
+                .borders(Borders::RIGHT)
+                .border_style(theme::faint()),
+        ),
         cols[0],
     );
 
@@ -926,7 +1478,7 @@ fn draw_snippets(f: &mut Frame, app: &mut App, area: Rect) {
     let body_w = (rows[0].width as usize).saturating_sub(digits + 4);
     let mut out: Vec<Line> = vec![
         Line::from(vec![
-            Span::styled(format!(" {}", s.title), bold()),
+            Span::styled(format!(" {}", s.title), theme::accent_b()),
             Span::styled(
                 format!(
                     "   {} · {} lines · from {}",
@@ -934,7 +1486,7 @@ fn draw_snippets(f: &mut Frame, app: &mut App, area: Rect) {
                     total_lines,
                     truncate(&who, 40)
                 ),
-                dim(),
+                theme::muted(),
             ),
         ]),
         Line::raw(""),
@@ -946,18 +1498,25 @@ fn draw_snippets(f: &mut Frame, app: &mut App, area: Rect) {
             continue;
         }
         let mut row = vec![
-            Span::styled(format!(" {:>digits$} ", i + 1), dim()),
-            Span::styled("│ ", dim()),
+            Span::styled(format!(" {:>digits$} ", i + 1), theme::muted()),
+            Span::styled("│ ", theme::faint()),
         ];
         row.extend(highlight::to_spans(&toks, h, body_w));
         out.push(Line::from(row));
     }
     f.render_widget(Paragraph::new(out), rows[0]);
+    let mut hl_line = vec![Span::raw(" ")];
+    hl_line.extend(hint("↑↓", "select"));
+    hl_line.push(Span::raw("   "));
+    hl_line.extend(hint("PgUp/PgDn", "scroll"));
+    hl_line.push(Span::raw("   "));
+    hl_line.extend(hint("←→", "pan"));
+    hl_line.push(Span::raw("   "));
+    hl_line.extend(hint("c", "copy"));
+    hl_line.push(Span::raw("   "));
+    hl_line.extend(hint("Esc", "close"));
     f.render_widget(
-        Paragraph::new(Span::styled(
-            " ↑↓ select · PgUp/PgDn scroll · ←→ pan · c copy · Esc close",
-            dim(),
-        )),
+        Paragraph::new(Line::from(hl_line)).alignment(Alignment::Left),
         rows[1],
     );
 }

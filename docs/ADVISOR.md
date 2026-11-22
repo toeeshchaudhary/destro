@@ -11,10 +11,13 @@ reports, and synthesises the final answer.
 - On first entry a picker appears with two fields:
   - **advisor model** — plans, judges, writes the final synthesis.
   - **slave models** — the route every spawned worker uses.
-- `Tab` switches fields, type to replace a value, `Enter` starts, `Esc` returns
-  to normal mode. `/normal` also leaves advisor mode.
-- Flags skip the picker: `destro --advisor-model deepseek-v4-pro --slave-model
-  deepseek-v4-flash` (with `--advisor` only when one field still needs a choice).
+- Values are `provider/model` routes and the suggestions cover every configured
+  provider, so an advisor on one vendor can drive workers on another. `Tab`
+  switches fields, type to replace a value, `Enter` starts, `Esc` returns to
+  normal mode. `/normal` also leaves advisor mode.
+- Flags skip the picker: `destro --advisor-model
+  refuseless/glm-5.3-flash-abliterated --slave-model deepseek/deepseek-flash`
+  (with `--advisor` only when one field still needs a choice).
 
 Nothing changes about how you submit a task: type it and press Enter. The
 advisor session is an ordinary session in the transcript, so every delegation

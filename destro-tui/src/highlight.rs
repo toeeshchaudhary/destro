@@ -3,7 +3,7 @@
 //! enough state for block comments and Python triple quotes; good for reading
 //! model output, not a parser.
 
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::Span;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -21,18 +21,19 @@ pub enum Tok {
 }
 
 pub fn style(t: Tok) -> Style {
+    let th = crate::theme::cur();
     let s = Style::default();
     match t {
-        Tok::Plain => s,
-        Tok::Kw => s.fg(Color::Magenta),
-        Tok::Str => s.fg(Color::Green),
-        Tok::Num => s.fg(Color::Yellow),
-        Tok::Comment => s.fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
-        Tok::Ty => s.fg(Color::Cyan),
-        Tok::Func => s.fg(Color::LightBlue),
-        Tok::Add => s.fg(Color::Green),
-        Tok::Del => s.fg(Color::Red),
-        Tok::Hunk => s.fg(Color::Cyan).add_modifier(Modifier::DIM),
+        Tok::Plain => s.fg(th.fg),
+        Tok::Kw => s.fg(th.kw),
+        Tok::Str => s.fg(th.str_),
+        Tok::Num => s.fg(th.num),
+        Tok::Comment => s.fg(th.muted).add_modifier(Modifier::ITALIC),
+        Tok::Ty => s.fg(th.ty),
+        Tok::Func => s.fg(th.func),
+        Tok::Add => s.fg(th.ok),
+        Tok::Del => s.fg(th.err),
+        Tok::Hunk => s.fg(th.accent2),
     }
 }
 
@@ -428,7 +429,7 @@ impl Highlighter {
                 return out;
             }
             let lead = n - trimmed.chars().count();
-            if let Some(pos) = trimmed.find(|c| c == '=' || c == ':') {
+            if let Some(pos) = trimmed.find(['=', ':']) {
                 let key = &trimmed[..pos];
                 if !key.is_empty()
                     && !key.contains('"')

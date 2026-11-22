@@ -169,9 +169,22 @@ async fn main() -> Result<()> {
     }
 
     let provider_id = args.provider.unwrap_or_else(|| registry.default_id());
-    let provider = registry
-        .build(&provider_id)
-        .map_err(|e| anyhow::anyhow!("provider {provider_id}: {e}"))?;
+    let mut providers: std::collections::HashMap<String, Arc<dyn destro_core::Provider>> =
+        std::collections::HashMap::new();
+    for info in registry.list() {
+        if info.configured
+            && let Ok(provider) = registry.build(&info.id)
+        {
+            providers.insert(info.id, provider);
+        }
+    }
+    if !providers.contains_key(&provider_id) {
+        let provider = registry
+            .build(&provider_id)
+            .map_err(|e| anyhow::anyhow!("provider {provider_id}: {e}"))?;
+        providers.insert(provider_id.clone(), provider);
+    }
+    let routes = destro_core::ProviderSet::new(provider_id.clone(), providers);
     let default_model = registry
         .descriptors()
         .iter()
@@ -179,7 +192,8 @@ async fn main() -> Result<()> {
         .map(|d| d.default_model.clone())
         .unwrap_or_else(|| "deepseek-v4-pro".into());
 
-    let mut cfg = HarnessConfig::new(provider);
+    let mut cfg = HarnessConfig::new(routes.default_provider());
+    cfg.providers = Some(routes);
     cfg.model = args.model.unwrap_or(default_model);
     cfg.cwd = args.cwd.clone();
     cfg.concurrency = args.concurrency;
@@ -269,10 +283,10 @@ async fn dispatch(server: &Arc<Server>, method: &str, params: Value) -> Option<V
                 Ok(a) => a,
                 Err(e) => return Some(json!({ "kind": "error", "messageId": e })),
             };
-            if !text.trim().is_empty() {
-                if let Ok(handle) = server.handle(agent) {
-                    let _ = handle.send(text, Delivery::Queue);
-                }
+            if !text.trim().is_empty()
+                && let Ok(handle) = server.handle(agent)
+            {
+                let _ = handle.send(text, Delivery::Queue);
             }
             Some(json!({ "kind": "prompt", "messageId": format!("u-{}", agent.0) }))
         }

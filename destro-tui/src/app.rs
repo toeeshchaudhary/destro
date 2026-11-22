@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use crate::backend::{Backend, Msg, ProjectSpec};
 use crate::balance::Balance;
 use crate::model::{Approval, Conn, Item, Project, Status};
+use crate::theme;
 use crate::ui::wrap;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -34,6 +35,108 @@ struct TabState {
 pub enum Mode {
     Normal,
     Advisor,
+}
+
+/// A slash command, shown in the `/` popup and the Ctrl+P palette.
+pub struct Cmd {
+    pub name: &'static str,
+    pub keys: &'static str,
+    pub desc: &'static str,
+    /// Takes an argument: choosing it prefills the prompt instead of running.
+    pub arg: bool,
+}
+
+pub const COMMANDS: [Cmd; 13] = [
+    Cmd {
+        name: "/new",
+        keys: "Alt+N",
+        desc: "start a new session in this workspace",
+        arg: false,
+    },
+    Cmd {
+        name: "/open",
+        keys: "Alt+O",
+        desc: "add a workspace folder",
+        arg: true,
+    },
+    Cmd {
+        name: "/close",
+        keys: "",
+        desc: "close this workspace and stop its runtime",
+        arg: false,
+    },
+    Cmd {
+        name: "/theme",
+        keys: "Ctrl+T",
+        desc: "pick a colour theme (or /theme <name>)",
+        arg: false,
+    },
+    Cmd {
+        name: "/advisor",
+        keys: "Alt+A",
+        desc: "advisor mode: planner + worker models",
+        arg: false,
+    },
+    Cmd {
+        name: "/normal",
+        keys: "",
+        desc: "leave advisor mode",
+        arg: false,
+    },
+    Cmd {
+        name: "/snippets",
+        keys: "Ctrl+S",
+        desc: "browse code from this session",
+        arg: false,
+    },
+    Cmd {
+        name: "/copy",
+        keys: "Ctrl+Y",
+        desc: "copy the newest code snippet",
+        arg: false,
+    },
+    Cmd {
+        name: "/sidebar",
+        keys: "Ctrl+B",
+        desc: "toggle the workspace sidebar",
+        arg: false,
+    },
+    Cmd {
+        name: "/panel",
+        keys: "Ctrl+G",
+        desc: "toggle the agents panel",
+        arg: false,
+    },
+    Cmd {
+        name: "/kill",
+        keys: "Ctrl+K",
+        desc: "abort this workspace's runtime",
+        arg: false,
+    },
+    Cmd {
+        name: "/help",
+        keys: "F1",
+        desc: "show every key binding",
+        arg: false,
+    },
+    Cmd {
+        name: "/quit",
+        keys: "Ctrl+Q",
+        desc: "exit destro",
+        arg: false,
+    },
+];
+
+/// Ctrl+P command palette state.
+pub struct Palette {
+    pub query: String,
+    pub sel: usize,
+}
+
+/// Ctrl+T theme picker; `original` is restored on Esc.
+pub struct ThemePick {
+    pub sel: usize,
+    pub original: usize,
 }
 
 /// Models offered before the user types their own.
@@ -98,6 +201,10 @@ pub struct App {
     /// Configured `(advisor, slave)` models once advisor mode is armed.
     pub advisor: Option<(String, String)>,
     pub setup: Option<AdvisorSetup>,
+    pub palette: Option<Palette>,
+    pub themes: Option<ThemePick>,
+    /// Highlighted row of the `/` suggestion popup.
+    pub slash_sel: usize,
     /// Model names offered by the selected provider.
     pub model_suggestions: Vec<String>,
     tab: Option<TabState>,
@@ -129,6 +236,9 @@ impl App {
             mode: Mode::Normal,
             advisor: None,
             setup: None,
+            palette: None,
+            themes: None,
+            slash_sel: 0,
             model_suggestions: MODEL_SUGGESTIONS.iter().map(|s| s.to_string()).collect(),
             tab: None,
             next_rpc: 1,
@@ -454,6 +564,128 @@ impl App {
         }
     }
 
+    // ----- commands, palette, themes ----------------------------------------------------
+
+    /// Commands matching what is typed after a leading `/` (no space yet).
+    pub fn slash_matches(&self) -> Vec<&'static Cmd> {
+        let t = self.input.as_str();
+        if !t.starts_with('/') || t.contains(' ') || t.contains('\n') {
+            return vec![];
+        }
+        let q = t.to_lowercase();
+        COMMANDS.iter().filter(|c| c.name.starts_with(&q)).collect()
+    }
+
+    pub fn palette_matches(&self) -> Vec<&'static Cmd> {
+        let q = self
+            .palette
+            .as_ref()
+            .map(|p| p.query.trim().trim_start_matches('/').to_lowercase())
+            .unwrap_or_default();
+        COMMANDS
+            .iter()
+            .filter(|c| {
+                q.is_empty()
+                    || c.name.trim_start_matches('/').contains(&q)
+                    || c.desc.to_lowercase().contains(&q)
+            })
+            .collect()
+    }
+
+    /// Put a command in the prompt. Arg-taking commands wait for their argument;
+    /// others complete (Tab) or run (Enter / palette).
+    fn run_cmd(&mut self, c: &Cmd, run: bool) {
+        if c.arg || !run {
+            self.input = format!("{} ", c.name);
+            if !c.arg {
+                self.input.pop();
+            }
+            self.cursor = self.input.chars().count();
+        } else {
+            self.input = c.name.to_string();
+            self.submit();
+        }
+    }
+
+    fn palette_key(&mut self, k: KeyEvent) {
+        let n = self.palette_matches().len();
+        let Some(p) = self.palette.as_mut() else {
+            return;
+        };
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        match k.code {
+            KeyCode::Esc => self.palette = None,
+            KeyCode::Char('p') if ctrl => self.palette = None,
+            KeyCode::Up => p.sel = p.sel.checked_sub(1).unwrap_or(n.saturating_sub(1)),
+            KeyCode::Down => p.sel = if n == 0 { 0 } else { (p.sel + 1) % n },
+            KeyCode::Backspace => {
+                p.query.pop();
+                p.sel = 0;
+            }
+            KeyCode::Char(c) if !ctrl => {
+                p.query.push(c);
+                p.sel = 0;
+            }
+            KeyCode::Enter => {
+                let sel = p.sel;
+                let cmd = self.palette_matches().get(sel).copied();
+                self.palette = None;
+                if let Some(c) = cmd {
+                    self.run_cmd(c, true);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Drop cached transcript lines: they bake the old colours in.
+    pub fn refresh_theme(&mut self) {
+        for p in self.projects.iter_mut() {
+            for s in p.sessions.iter_mut() {
+                s.cache.invalidate();
+            }
+        }
+    }
+
+    fn open_theme_picker(&mut self) {
+        let cur = theme::index();
+        self.themes = Some(ThemePick {
+            sel: cur,
+            original: cur,
+        });
+    }
+
+    fn theme_key(&mut self, k: KeyEvent) {
+        let n = theme::THEMES.len();
+        let Some(tp) = self.themes.as_mut() else {
+            return;
+        };
+        match k.code {
+            KeyCode::Up | KeyCode::Char('k') => tp.sel = (tp.sel + n - 1) % n,
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => tp.sel = (tp.sel + 1) % n,
+            KeyCode::Enter => {
+                let sel = tp.sel;
+                self.themes = None;
+                theme::set_index(sel);
+                self.refresh_theme();
+                crate::config::save_theme(theme::cur().name);
+                self.flash(format!("theme: {}", theme::cur().name));
+                return;
+            }
+            KeyCode::Esc | KeyCode::Char('q') => {
+                let orig = tp.original;
+                self.themes = None;
+                theme::set_index(orig);
+                self.refresh_theme();
+                return;
+            }
+            _ => return,
+        }
+        let sel = self.themes.as_ref().map(|t| t.sel).unwrap_or(0);
+        theme::set_index(sel); // live preview
+        self.refresh_theme();
+    }
+
     // ----- input ------------------------------------------------------------------------
 
     fn submit(&mut self) {
@@ -465,6 +697,26 @@ impl App {
         }
         match text.as_str() {
             "/help" => self.help = true,
+            "/theme" => self.open_theme_picker(),
+            _ if text.starts_with("/theme ") => {
+                let name = text["/theme ".len()..].trim();
+                if theme::set_by_name(name) {
+                    self.refresh_theme();
+                    crate::config::save_theme(theme::cur().name);
+                    self.flash(format!("theme: {}", theme::cur().name));
+                } else {
+                    self.flash(format!("unknown theme; try: {}", theme::names()));
+                }
+            }
+            "/copy" => {
+                if let Some(code) = self.cur_snippets().last().map(|s| s.code.clone()) {
+                    self.copy(&code);
+                } else {
+                    self.flash("no snippet to copy yet".into());
+                }
+            }
+            "/sidebar" => self.show_sidebar = !self.show_sidebar,
+            "/panel" => self.show_right = !self.show_right,
             "/quit" | "/exit" => self.quit = true,
             "/new" => self.cur_session = None,
             "/advisor" => self.enter_advisor(),
@@ -546,6 +798,14 @@ impl App {
             self.advisor_setup_key(k);
             return;
         }
+        if self.themes.is_some() {
+            self.theme_key(k);
+            return;
+        }
+        if self.palette.is_some() {
+            self.palette_key(k);
+            return;
+        }
         if self.pending_modal().is_some() {
             match k.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => self.answer(true),
@@ -556,8 +816,47 @@ impl App {
             return;
         }
         let page = 10usize;
+        // `/` suggestion popup owns the arrows, Tab, Enter and Esc while it is open
+        let popup = self.slash_matches();
+        if !popup.is_empty() && !alt && !ctrl {
+            match k.code {
+                KeyCode::Up => {
+                    self.slash_sel = self.slash_sel.checked_sub(1).unwrap_or(popup.len() - 1);
+                    return;
+                }
+                KeyCode::Down => {
+                    self.slash_sel = (self.slash_sel + 1) % popup.len();
+                    return;
+                }
+                KeyCode::Tab | KeyCode::Enter => {
+                    let c = popup[self.slash_sel.min(popup.len() - 1)];
+                    let exact = self.input.trim() == c.name;
+                    if k.code == KeyCode::Enter && exact && !c.arg {
+                        self.submit();
+                    } else {
+                        self.run_cmd(c, k.code == KeyCode::Enter);
+                    }
+                    return;
+                }
+                KeyCode::Esc => {
+                    self.input.clear();
+                    self.cursor = 0;
+                    return;
+                }
+                _ => {}
+            }
+        }
         match k.code {
             KeyCode::F(1) => self.help = true,
+            KeyCode::Char('p') if ctrl => {
+                self.palette = Some(Palette {
+                    query: String::new(),
+                    sel: 0,
+                })
+            }
+            KeyCode::Char('t') if ctrl => self.open_theme_picker(),
+            KeyCode::Up if self.input.is_empty() => self.scroll(3),
+            KeyCode::Down if self.input.is_empty() => self.scroll(-3),
             KeyCode::Up if alt => self.step(-1),
             KeyCode::Down if alt => self.step(1),
             KeyCode::Char(c @ '1'..='9') if alt => {
@@ -640,6 +939,7 @@ impl App {
     }
 
     fn insert(&mut self, c: char) {
+        self.slash_sel = 0;
         let i = self.byte_at(self.cursor);
         self.input.insert(i, c);
         self.cursor += 1;
@@ -688,12 +988,11 @@ impl App {
 
     fn expand(raw: &str) -> PathBuf {
         let raw = raw.trim().trim_matches('"');
-        if raw == "~" || raw.starts_with("~/") || raw.starts_with("~\\") {
-            if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))
-            {
-                return PathBuf::from(home)
-                    .join(raw.trim_start_matches('~').trim_start_matches(['/', '\\']));
-            }
+        if (raw == "~" || raw.starts_with("~/") || raw.starts_with("~\\"))
+            && let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))
+        {
+            return PathBuf::from(home)
+                .join(raw.trim_start_matches('~').trim_start_matches(['/', '\\']));
         }
         PathBuf::from(raw)
     }

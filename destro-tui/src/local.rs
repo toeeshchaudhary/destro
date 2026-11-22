@@ -12,7 +12,9 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 
-use destro_core::{AgentId, Delivery, Harness, HarnessConfig, HarnessEvent, Provider, SpawnSpec};
+use destro_core::{
+    AgentId, Delivery, Harness, HarnessConfig, HarnessEvent, ProviderSet, SpawnSpec,
+};
 use destro_proto::{Frame, ServerInfo, ext, method, notify};
 
 use crate::backend::{Backend, Msg, ProjectSpec};
@@ -85,14 +87,14 @@ pub struct Local {
     slots: Mutex<Vec<Option<Slot>>>,
     tx: Sender<Msg>,
     model: String,
-    provider: Arc<dyn Provider>,
+    providers: Arc<ProviderSet>,
 }
 
 impl Local {
     pub fn start(
         specs: &[ProjectSpec],
         model: &str,
-        provider: Arc<dyn Provider>,
+        provider: Arc<ProviderSet>,
         tx: Sender<Msg>,
     ) -> (Vec<Project>, Local) {
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -118,7 +120,7 @@ impl Local {
             slots: Mutex::new(slots),
             tx,
             model: model.to_string(),
-            provider,
+            providers: provider,
         };
         let projects = specs
             .iter()
@@ -133,10 +135,11 @@ impl Local {
         name: &str,
         cwd: &str,
         setup: Setup,
-        provider: Arc<dyn Provider>,
+        providers: Arc<ProviderSet>,
         tx: &Sender<Msg>,
     ) -> Slot {
-        let mut cfg = HarnessConfig::new(provider);
+        let mut cfg = HarnessConfig::new(providers.default_provider());
+        cfg.providers = Some(providers);
         cfg.model = setup.model.clone();
         cfg.cwd = std::path::PathBuf::from(cwd);
         cfg.system = setup.system.clone();
@@ -419,7 +422,7 @@ impl Backend for Local {
             &spec.name,
             &spec.cwd,
             normal_setup(&self.model),
-            self.provider.clone(),
+            self.providers.clone(),
             &self.tx,
         );
         self.slots.lock().unwrap()[project] = Some(slot);
@@ -438,7 +441,7 @@ impl Backend for Local {
             &name,
             &cwd,
             advisor_setup(advisor, slave),
-            self.provider.clone(),
+            self.providers.clone(),
             &self.tx,
         );
         if let Some(s) = self.slots.lock().unwrap().get_mut(project) {

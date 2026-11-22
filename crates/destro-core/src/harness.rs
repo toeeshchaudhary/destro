@@ -4,7 +4,7 @@
 //! sequence of atomic reads; steering goes through each agent's mailbox, so the
 //! registry never sits between the operator and a working agent's loop.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -37,6 +37,51 @@ pub struct SpawnSpec {
     pub priority: Option<Priority>,
 }
 
+/// Providers addressable by a `provider/model` route string.
+///
+/// Advisor mode needs an advisor on one vendor and workers on another; a single
+/// provider handle cannot express that. `resolve` splits a prefixed model, else
+/// falls back to the default provider and an unprefixed model.
+pub struct ProviderSet {
+    providers: HashMap<String, Arc<dyn Provider>>,
+    default: String,
+}
+
+impl ProviderSet {
+    pub fn new(
+        default: impl Into<String>,
+        providers: HashMap<String, Arc<dyn Provider>>,
+    ) -> Arc<ProviderSet> {
+        Arc::new(ProviderSet {
+            providers,
+            default: default.into(),
+        })
+    }
+
+    /// `(provider, model)`. Accepts `vendor/model` or `vendor:model`; unknown
+    /// prefixes stay part of the model name.
+    pub fn resolve(&self, model: &str) -> (Arc<dyn Provider>, String) {
+        if let Some((prefix, rest)) = model.split_once('/').or_else(|| model.split_once(':'))
+            && let Some(provider) = self.providers.get(prefix)
+        {
+            return (provider.clone(), rest.to_string());
+        }
+        (self.default_provider(), model.to_string())
+    }
+
+    pub fn default_provider(&self) -> Arc<dyn Provider> {
+        self.providers
+            .get(&self.default)
+            .or_else(|| self.providers.values().next())
+            .cloned()
+            .unwrap_or_else(|| Arc::new(crate::provider::MockProvider::echo()))
+    }
+
+    pub fn ids(&self) -> Vec<&str> {
+        self.providers.keys().map(String::as_str).collect()
+    }
+}
+
 #[derive(Clone)]
 pub struct HarnessConfig {
     pub provider: Arc<dyn Provider>,
@@ -48,6 +93,8 @@ pub struct HarnessConfig {
     pub slave_model: Option<String>,
     /// System prompt for child agents; both advisor and workers get their own.
     pub slave_system: Option<String>,
+    /// Multi-provider routing. When set, `provider/model` route strings resolve.
+    pub providers: Option<Arc<ProviderSet>>,
     /// Model requests allowed per turn (tool steps).
     pub max_steps: u32,
     /// Concurrent provider requests across all agents.
@@ -68,6 +115,7 @@ impl HarnessConfig {
             max_steps: 64,
             slave_model: None,
             slave_system: None,
+            providers: None,
             concurrency: 24,
             interactive_reserve: 4,
             event_buffer: 8192,
@@ -98,6 +146,7 @@ pub struct Harness {
     pub max_steps: u32,
     pub slave_model: Option<String>,
     pub slave_system: Option<String>,
+    pub providers: Option<Arc<ProviderSet>>,
 }
 
 impl Harness {
@@ -122,6 +171,7 @@ impl Harness {
             max_steps: cfg.max_steps.max(1),
             slave_model: cfg.slave_model,
             slave_system: cfg.slave_system,
+            providers: cfg.providers,
         });
         let _ = tool_host.set(Arc::downgrade(&harness));
         harness
@@ -155,7 +205,11 @@ impl Harness {
         } else {
             self.model.clone()
         };
-        let model = spec.model.unwrap_or(default_model);
+        let requested = spec.model.unwrap_or(default_model);
+        let (provider, model) = match &self.providers {
+            Some(set) => set.resolve(&requested),
+            None => (self.provider.clone(), requested),
+        };
         let live = Live::new(id, parent, &model, spec.title.clone());
         let parent_live = parent_handle.as_ref().map(|h| h.live.clone());
         let cancel = match &parent_handle {
@@ -187,7 +241,7 @@ impl Harness {
             id,
             live,
             parent_live,
-            provider: self.provider.clone(),
+            provider: provider.clone(),
             tools: self.tools.clone(),
             gate: self.gate.clone(),
             bus: self.bus.clone(),

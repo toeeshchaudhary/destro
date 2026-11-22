@@ -148,20 +148,32 @@ pub fn fanout_chains(scr: &mut Gen, sid: &str, prompt: &str, approval_id: u64) -
         format!("{sid}.tests"),
         format!("{sid}.store"),
     );
-    let mut parent = vec![];
-    parent.push(s(0, scr.status(sid, "running")));
-    parent.push(s(0, scr.turn(sid, 1, true)));
-    parent.push(s(0, scr.user(sid, 1, prompt, "user")));
-    parent.push(s(350, scr.assistant(sid, 1,
-        Some("Three independent questions: where the middleware reads credentials, whether the suite is green before I touch it, and how sessions are persisted. Run them in parallel and merge."),
-        Some("Splitting this into three parallel investigations before changing anything: a call-site map, a test baseline, and the session-store schema."),
-        (18_240, 212, 0))));
-    let (id, f) = scr.call(sid, 1, "todo_write", json!({"todos":["map auth call sites","baseline tests","inspect session store","write migration"]}));
-    parent.push(s(700, f));
-    parent.push(s(
-        760,
-        scr.result(sid, 1, &id, "todo list updated (4 items)", false),
-    ));
+    let (id, call) = scr.call(
+        sid,
+        1,
+        "todo_write",
+        json!({"todos":["map auth call sites","baseline tests","inspect session store","write migration"]}),
+    );
+    let mut parent = vec![
+        s(0, scr.status(sid, "running")),
+        s(0, scr.turn(sid, 1, true)),
+        s(0, scr.user(sid, 1, prompt, "user")),
+        s(
+            350,
+            scr.assistant(
+                sid,
+                1,
+                Some("Three independent questions: where the middleware reads credentials, whether the suite is green before I touch it, and how sessions are persisted. Run them in parallel and merge."),
+                Some("Splitting this into three parallel investigations before changing anything: a call-site map, a test baseline, and the session-store schema."),
+                (18_240, 212, 0),
+            ),
+        ),
+        s(700, call),
+        s(
+            760,
+            scr.result(sid, 1, &id, "todo list updated (4 items)", false),
+        ),
+    ];
     for (i, c) in [&c1, &c2, &c3].iter().enumerate() {
         parent.push(s(1000 + i as u64 * 120, Gen::sub_started(sid, c)));
     }

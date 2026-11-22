@@ -104,10 +104,10 @@ pub fn parse(body: &str) -> Result<Info, String> {
 
 /// `DEEPSEEK_API_KEY` from the environment, else from `.env` in any of `dirs`.
 pub fn find_key(dirs: &[String]) -> Option<String> {
-    if let Ok(k) = std::env::var("DEEPSEEK_API_KEY") {
-        if !k.trim().is_empty() {
-            return Some(k.trim().to_string());
-        }
+    if let Ok(k) = std::env::var("DEEPSEEK_API_KEY")
+        && !k.trim().is_empty()
+    {
+        return Some(k.trim().to_string());
     }
     for d in dirs.iter().map(String::as_str).chain(std::iter::once(".")) {
         if let Ok(text) = std::fs::read_to_string(std::path::Path::new(d).join(".env")) {

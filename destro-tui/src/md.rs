@@ -2,14 +2,15 @@
 //! line-number gutter), headings, bullets, quotes, `inline code` and **bold**.
 //! Output is pre-wrapped `Line`s so the transcript cache can slice them cheaply.
 
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::highlight::{self, Highlighter, expand_tabs};
+use crate::theme;
 
 fn dim() -> Style {
-    Style::default().add_modifier(Modifier::DIM)
+    theme::muted()
 }
 
 /// Every fenced code block in `text` as `(language tag, code)`.
@@ -47,25 +48,27 @@ fn inline(text: &str, base: Style) -> Vec<Seg> {
     };
     let mut i = 0;
     while i < ch.len() {
-        if ch[i] == '`' {
-            if let Some(end) = ch[i + 1..].iter().position(|&c| c == '`') {
-                flush(&mut buf, &mut segs);
-                let code: String = ch[i + 1..i + 1 + end].iter().collect();
-                segs.push((code, base.fg(Color::Yellow).bg(Color::Indexed(236))));
-                i += end + 2;
-                continue;
-            }
+        if ch[i] == '`'
+            && let Some(end) = ch[i + 1..].iter().position(|&c| c == '`')
+        {
+            flush(&mut buf, &mut segs);
+            let code: String = ch[i + 1..i + 1 + end].iter().collect();
+            let th = theme::cur();
+            segs.push((format!(" {code} "), base.fg(th.warn).bg(th.code)));
+            i += end + 2;
+            continue;
         }
-        if ch[i] == '*' && i + 1 < ch.len() && ch[i + 1] == '*' {
-            if let Some(end) =
+        if ch[i] == '*'
+            && i + 1 < ch.len()
+            && ch[i + 1] == '*'
+            && let Some(end) =
                 (i + 2..ch.len().saturating_sub(1)).find(|&j| ch[j] == '*' && ch[j + 1] == '*')
-            {
-                flush(&mut buf, &mut segs);
-                let b: String = ch[i + 2..end].iter().collect();
-                segs.push((b, base.add_modifier(Modifier::BOLD)));
-                i = end + 2;
-                continue;
-            }
+        {
+            flush(&mut buf, &mut segs);
+            let b: String = ch[i + 2..end].iter().collect();
+            segs.push((b, base.add_modifier(Modifier::BOLD)));
+            i = end + 2;
+            continue;
         }
         buf.push(ch[i]);
         i += 1;
@@ -176,7 +179,8 @@ fn clip(spans: Vec<Span<'static>>, max: usize) -> Vec<Span<'static>> {
     out
 }
 
-/// A highlighted code block with a line-number gutter. `max_lines` bounds the preview.
+/// A highlighted code block with a line-number gutter on a tinted background.
+/// `max_lines` bounds the preview.
 pub fn code_block(
     tag: &str,
     code: &str,
@@ -189,17 +193,20 @@ pub fn code_block(
     let total = lines.len();
     let digits = total.to_string().len().max(2);
     let label = if tag.is_empty() { "text" } else { tag };
-    out.push(Line::from(vec![
-        Span::styled(format!("{indent}╭─ "), dim()),
-        Span::styled(
-            label.to_string(),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("  {total} line{}", if total == 1 { "" } else { "s" }),
-            dim(),
-        ),
-    ]));
+    let bg = theme::code_bg();
+    let edge = theme::faint().patch(bg);
+    out.push(
+        Line::from(vec![
+            Span::raw(indent.to_string()),
+            Span::styled(" ", bg),
+            Span::styled(format!(" {label} "), theme::chip(theme::cur().accent2)),
+            Span::styled(
+                format!("  {total} line{}", if total == 1 { "" } else { "s" }),
+                dim().patch(bg),
+            ),
+        ])
+        .style(bg),
+    );
     let mut hl = Highlighter::new(tag);
     let body_w = width.saturating_sub(indent.width() + digits + 4);
     for (n, raw) in lines.iter().enumerate() {
@@ -208,23 +215,25 @@ pub fn code_block(
             continue;
         }
         let mut row = vec![
-            Span::styled(format!("{indent}│ "), dim()),
-            Span::styled(format!("{:>digits$} ", n + 1), dim()),
+            Span::raw(indent.to_string()),
+            Span::styled(format!(" {:>digits$} ", n + 1), dim().patch(bg)),
+            Span::styled("│ ", edge),
         ];
         row.extend(clip(highlight::to_spans(&toks, 0, usize::MAX), body_w));
-        out.push(Line::from(row));
+        out.push(Line::from(row).style(bg));
     }
-    if total > max_lines {
-        out.push(Line::styled(
-            format!(
-                "{indent}╰─ … {} more lines · Ctrl+S to open",
-                total - max_lines
-            ),
-            dim(),
-        ));
+    let foot = if total > max_lines {
+        format!(" … {} more lines · Ctrl+S to open", total - max_lines)
     } else {
-        out.push(Line::styled(format!("{indent}╰─"), dim()));
-    }
+        " ".to_string()
+    };
+    out.push(
+        Line::from(vec![
+            Span::raw(indent.to_string()),
+            Span::styled(foot, dim().patch(bg)),
+        ])
+        .style(bg),
+    );
 }
 
 pub fn layout(text: &str, width: usize, out: &mut Vec<Line<'static>>) {
@@ -249,8 +258,9 @@ pub fn layout(text: &str, width: usize, out: &mut Vec<Line<'static>>) {
             .or_else(|| t.strip_prefix("## "))
             .or_else(|| t.strip_prefix("# "))
         {
-            let st = Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
-            wrap_segs(inline(h, st), width, "  ", "  ", Style::default(), out);
+            let st = theme::accent_b();
+            out.push(Line::raw(""));
+            wrap_segs(inline(h, st), width, "  ", "  ", theme::text(), out);
         } else if let Some(b) = t
             .strip_prefix("- ")
             .or_else(|| t.strip_prefix("* "))
@@ -259,35 +269,42 @@ pub fn layout(text: &str, width: usize, out: &mut Vec<Line<'static>>) {
             let lead = line.len() - t.len();
             let pad = " ".repeat(lead);
             wrap_segs(
-                inline(b, Style::default()),
+                inline(b, theme::text()),
                 width,
                 &format!("  {pad}• "),
                 &format!("  {pad}  "),
-                dim(),
+                theme::accent(),
                 out,
             );
         } else if let Some(q) = t.strip_prefix("> ") {
-            wrap_segs(inline(q, dim()), width, "  ▎ ", "  ▎ ", dim(), out);
+            wrap_segs(
+                inline(q, dim().add_modifier(Modifier::ITALIC)),
+                width,
+                "  ▎ ",
+                "  ▎ ",
+                theme::accent2(),
+                out,
+            );
         } else if let Some((num, body)) = numbered(t) {
             let lead = line.len() - t.len();
             let pad = " ".repeat(lead);
             let marker = format!("  {pad}{num}. ");
             let hang = " ".repeat(marker.width());
             wrap_segs(
-                inline(body, Style::default()),
+                inline(body, theme::text()),
                 width,
                 &marker,
                 &hang,
-                dim(),
+                theme::accent(),
                 out,
             );
         } else {
             wrap_segs(
-                inline(t, Style::default()),
+                inline(t, theme::text()),
                 width,
                 "  ",
                 "  ",
-                Style::default(),
+                theme::text(),
                 out,
             );
         }

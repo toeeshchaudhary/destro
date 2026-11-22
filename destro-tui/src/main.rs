@@ -7,6 +7,7 @@ mod highlight;
 mod local;
 mod md;
 mod model;
+mod theme;
 mod ui;
 mod updater;
 
@@ -46,11 +47,13 @@ OPTIONS
                     render a demo frame to stdout and exit
   --bench <N>       ingest N synthetic events, time rendering, exit
   --probe           run the in-process harness once, print the transcript, exit
+  --prompt <text>   prompt used by --probe
   --advisor         start in advisor mode (prompts for planner + worker models)
   --advisor-model <id>  advisor model, skips its picker field
   --slave-model <id>    worker model, skips its picker field
   --update          same as `update`
   --providers       same as `providers`
+  --theme <name>    colour theme (else the saved choice; Ctrl+T in the TUI)
   --version         print the version and exit
 ENV
   DEEPSEEK_API_KEY  enables the balance readout (env or .env)
@@ -71,6 +74,8 @@ struct Args {
     slave_model: Option<String>,
     update: bool,
     providers: bool,
+    theme: Option<String>,
+    prompt: Option<String>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -89,6 +94,8 @@ fn parse_args() -> Result<Args> {
         slave_model: None,
         update: false,
         providers: false,
+        theme: None,
+        prompt: None,
     };
     let mut it = std::env::args().skip(1).peekable();
     while let Some(x) = it.next() {
@@ -105,9 +112,13 @@ fn parse_args() -> Result<Args> {
             "--project" => a.projects.push(it.next().unwrap_or_default()),
             "--provider" => a.provider = it.next().unwrap_or_default(),
             "--model" => a.model = it.next().unwrap_or_default(),
+            "--theme" => a.theme = it.next(),
             "--snapshot" => {
                 let mode = match it.peek().map(String::as_str) {
-                    Some("done" | "snippets" | "open") => it.next().unwrap(),
+                    Some(
+                        "done" | "snippets" | "open" | "palette" | "themes" | "help" | "slash"
+                        | "fresh",
+                    ) => it.next().unwrap(),
                     _ => String::new(),
                 };
                 a.snapshot = Some(mode);
@@ -120,6 +131,7 @@ fn parse_args() -> Result<Args> {
             "--slave-model" => a.slave_model = it.next(),
             "--update" | "update" => a.update = true,
             "--providers" | "providers" => a.providers = true,
+            "--prompt" => a.prompt = it.next(),
             "--version" | "-V" => {
                 println!("destro {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
@@ -131,10 +143,10 @@ fn parse_args() -> Result<Args> {
             other => anyhow::bail!("unknown argument {other:?}\n\n{USAGE}"),
         }
     }
-    if a.dsh.is_empty() {
-        if let Ok(v) = std::env::var("DESTRO_DSH") {
-            a.dsh = v.split_whitespace().map(String::from).collect();
-        }
+    if a.dsh.is_empty()
+        && let Ok(v) = std::env::var("DESTRO_DSH")
+    {
+        a.dsh = v.split_whitespace().map(String::from).collect();
     }
     Ok(a)
 }
@@ -183,7 +195,7 @@ fn snapshot(mode: &str) -> Result<()> {
     )));
     let mut scr = demo::Gen::default();
     let mut next_approval = 100;
-    let finished = mode != "";
+    let finished = !mode.is_empty();
     for p in 0..3 {
         app.on_frame(p, &json!({"jsonrpc":"2.0","id":0,"result":{}}).to_string());
         let mut steps: Vec<demo::Step> = demo::boot_steps(&mut scr, p, &mut next_approval)
@@ -207,6 +219,21 @@ fn snapshot(mode: &str) -> Result<()> {
             app.open_workspace("~/Documents/destro-tui")
                 .map_err(anyhow::Error::msg)?;
         }
+        "palette" => {
+            app.palette = Some(app::Palette {
+                query: String::new(),
+                sel: 1,
+            })
+        }
+        "themes" => {
+            app.themes = Some(app::ThemePick {
+                sel: 2,
+                original: theme::index(),
+            })
+        }
+        "help" => app.help = true,
+        "slash" => app.input = "/th".into(),
+        "fresh" => app.cur_session = None,
         _ => {}
     }
     app.tick = 3;
@@ -285,6 +312,41 @@ fn bench(n: usize, hold: bool) -> Result<()> {
     Ok(())
 }
 
+/// Build a route set from every configured provider. `preferred` names the
+/// default; unconfigured providers are skipped, and mock is the last resort.
+fn provider_set(
+    registry: &destro_core::ProviderRegistry,
+    preferred: &str,
+) -> Result<std::sync::Arc<destro_core::ProviderSet>> {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    let default = match preferred {
+        "" | "deepseek-official" => registry.default_id(),
+        id => id.to_string(),
+    };
+    let mut map: HashMap<String, Arc<dyn destro_core::Provider>> = HashMap::new();
+    for info in registry.list() {
+        if !info.configured {
+            continue;
+        }
+        if let Ok(provider) = registry.build(&info.id) {
+            map.insert(info.id, provider);
+        }
+    }
+    if map.is_empty() {
+        map.insert(
+            "mock".into(),
+            Arc::new(destro_core::MockProvider::echo()) as Arc<dyn destro_core::Provider>,
+        );
+        return Ok(destro_core::ProviderSet::new("mock", map));
+    }
+    if !map.contains_key(&default) {
+        let fallback = map.keys().next().cloned().unwrap_or_else(|| "mock".into());
+        return Ok(destro_core::ProviderSet::new(fallback, map));
+    }
+    Ok(destro_core::ProviderSet::new(default, map))
+}
+
 /// End-to-end check of the in-process path without a terminal: drive the local
 /// backend exactly as the TUI would and assert the transcript arrives.
 fn probe(args: &Args) -> Result<()> {
@@ -294,16 +356,9 @@ fn probe(args: &Args) -> Result<()> {
         cwd: cwd.clone(),
     }];
     let registry = destro_core::ProviderRegistry::load();
-    let provider_id = match args.provider.as_str() {
-        "" | "deepseek-official" => registry.default_id(),
-        id => id.to_string(),
-    };
-    let provider = match registry.build(&provider_id) {
-        Ok(provider) => provider,
-        Err(_) => std::sync::Arc::new(destro_core::MockProvider::echo()),
-    };
+    let providers = provider_set(&registry, &args.provider)?;
     let (tx, rx) = mpsc::channel();
-    let (projects, local) = Local::start(&specs, &args.model, provider, tx);
+    let (projects, local) = Local::start(&specs, &args.model, providers, tx);
     let mut app = App::new(projects, Box::new(local));
     if let (Some(a), Some(b)) = (&args.advisor_model, &args.slave_model) {
         app.arm_advisor(a, b);
@@ -315,17 +370,23 @@ fn probe(args: &Args) -> Result<()> {
         0,
         json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"cwd": cwd}}),
     );
+    let prompt = args
+        .prompt
+        .clone()
+        .unwrap_or_else(|| "probe run please".into());
     app.backend.send(
         0,
         json!({"jsonrpc":"2.0","id":1,"method":"session/query","params":{
             "sessionId": "probe-session",
-            "contentBlocks": [{"type": "text", "text": "probe run please"}]
+            "contentBlocks": [{"type": "text", "text": prompt}]
         }}),
     );
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let window = if app.advisor.is_some() { 75 } else { 20 };
+    let deadline = Instant::now() + Duration::from_secs(window);
     let mut replied = false;
-    while Instant::now() < deadline && !replied {
+    // In advisor mode keep listening after the first reply so delegations land too.
+    while Instant::now() < deadline && (!replied || app.advisor.is_some()) {
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(msg) => app.on_msg(msg),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -349,7 +410,7 @@ fn probe(args: &Args) -> Result<()> {
         println!("advisor: {advisor}  slaves: {slaves}");
     }
     if !replied {
-        anyhow::bail!("in-process harness produced no assistant transcript within 5s");
+        anyhow::bail!("in-process harness produced no assistant transcript within 20s");
     }
     Ok(())
 }
@@ -398,6 +459,18 @@ fn list_providers() -> Result<()> {
 
 fn main() -> Result<()> {
     let args = parse_args()?;
+    match &args.theme {
+        Some(name) => {
+            if !theme::set_by_name(name) {
+                anyhow::bail!("unknown theme {name:?}; available: {}", theme::names());
+            }
+        }
+        None => {
+            if let Some(saved) = config::load_theme() {
+                theme::set_by_name(&saved);
+            }
+        }
+    }
     if let Some(mode) = &args.snapshot {
         return snapshot(mode);
     }
@@ -462,22 +535,17 @@ fn main() -> Result<()> {
         };
         if local_mode {
             let registry = destro_core::ProviderRegistry::load();
-            let provider_id = match args.provider.as_str() {
-                "" | "deepseek-official" => registry.default_id(),
-                id => id.to_string(),
-            };
-            let provider = match registry.build(&provider_id) {
-                Ok(provider) => provider,
-                Err(e) => anyhow::bail!("provider {provider_id}: {e}\nsee docs/PROVIDERS.md"),
-            };
-            provider_label = provider_id.clone();
-            suggestions = registry
-                .list()
-                .into_iter()
-                .find(|info| info.id == provider_id)
-                .map(|info| info.models)
-                .unwrap_or_default();
-            let (ps, local) = Local::start(&specs, &args.model, provider, tx.clone());
+            let providers = provider_set(&registry, &args.provider)?;
+            provider_label = args.provider.clone();
+            for info in registry.list() {
+                if !info.configured || info.id == "mock" {
+                    continue;
+                }
+                for model in &info.models {
+                    suggestions.push(format!("{}/{}", info.id, model));
+                }
+            }
+            let (ps, local) = Local::start(&specs, &args.model, providers, tx.clone());
             (
                 ps,
                 Box::new(local) as Box<dyn Backend>,
