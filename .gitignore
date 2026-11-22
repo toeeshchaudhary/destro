@@ -1,0 +1,7 @@
+/target/
+**/*.rs.bk
+**/*.old
+.env
+.env.*
+/upstream-deepseek-harness/
+/_in/

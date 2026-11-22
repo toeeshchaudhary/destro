@@ -1,0 +1,14 @@
+[package]
+name = "destro-tools"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+futures-core.workspace = true
+regex.workspace = true
+ignore.workspace = true
+globset.workspace = true
+memchr.workspace = true

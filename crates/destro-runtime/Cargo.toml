@@ -1,0 +1,17 @@
+[package]
+name = "destro-runtime"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "destro-harness"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+destro-core = { path = "../destro-core" }
+destro-proto = { path = "../destro-proto" }

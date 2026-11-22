@@ -1,0 +1,20 @@
+[package]
+name = "destro-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures-core.workspace = true
+futures-util.workspace = true
+parking_lot.workspace = true
+# Declared directly: the workspace entry names the `rustls-tls` feature, which
+# reqwest 0.13 renamed to `rustls`, so `reqwest.workspace = true` would fail.
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "http2", "stream", "json"] }
+destro-proto = { path = "../destro-proto" }
+destro-tools = { path = "../destro-tools" }

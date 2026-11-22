@@ -1,0 +1,39 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: build and publish
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binaries
+        run: cargo build --release --workspace
+
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target/release/destro.exe" "dist/destro-x86_64-pc-windows-msvc.exe"
+          Copy-Item "target/release/destro-harness.exe" "dist/destro-harness-x86_64-pc-windows-msvc.exe"
+
+          gh release create "$env:TAG" `
+            --title "$env:TAG" `
+            --generate-notes `
+            "dist/destro-x86_64-pc-windows-msvc.exe" `
+            "dist/destro-harness-x86_64-pc-windows-msvc.exe"
