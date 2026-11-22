@@ -438,7 +438,7 @@ fn write_session(
         let mut w = SessionWriter::open_at_with(&tmp, cwd, id, "", "dsh", extra)
             .map_err(|e| e.to_string())?;
         for e in events {
-            w.append(e);
+            w.append(e).map_err(|e| e.to_string())?;
         }
     }
     let _ = std::fs::remove_file(path);

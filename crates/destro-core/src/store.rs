@@ -184,8 +184,8 @@ impl SessionWriter {
         Ok(SessionWriter { file })
     }
 
-    pub fn append(&mut self, event: &Value) {
-        let _ = writeln!(self.file, "{event}");
+    pub fn append(&mut self, event: &Value) -> std::io::Result<()> {
+        self.file.write_all(format!("{event}\n").as_bytes())
     }
 }
 
@@ -395,13 +395,23 @@ pub fn fork(path: &Path, new_id: &str) -> std::io::Result<PathBuf> {
 /// Search prompts and replies of every saved session, all workspaces, newest
 /// first. Matching is a case-insensitive substring.
 pub fn search(query: &str, limit: usize) -> Vec<SearchHit> {
-    let q = query.trim().to_lowercase();
     let Some(root) = sessions_root() else {
         return vec![];
     };
+    search_in(&root, query, limit)
+}
+
+fn search_in(root: &Path, query: &str, limit: usize) -> Vec<SearchHit> {
+    let q = query.trim();
     if q.is_empty() {
         return vec![];
     }
+    let Ok(matcher) = regex::RegexBuilder::new(&regex::escape(q))
+        .case_insensitive(true)
+        .build()
+    else {
+        return vec![];
+    };
     let mut hits = vec![];
     for ws in std::fs::read_dir(root).into_iter().flatten().flatten() {
         for e in std::fs::read_dir(ws.path()).into_iter().flatten().flatten() {
@@ -422,9 +432,8 @@ pub fn search(query: &str, limit: usize) -> Vec<SearchHit> {
                     Some("user/message") => blocks_text(&v["data"]["content"]),
                     _ => blocks_text(&v["data"]["message"]["content"]),
                 };
-                let lower = text.to_lowercase();
-                if let Some(at) = lower.find(&q) {
-                    snippet = Some(excerpt(&text, at, q.len()));
+                if let Some(found) = matcher.find(&text) {
+                    snippet = Some(excerpt(&text, found.start(), found.end()));
                     break;
                 }
             }
@@ -439,10 +448,10 @@ pub fn search(query: &str, limit: usize) -> Vec<SearchHit> {
 }
 
 /// ~100 characters of context around a match, on one line.
-fn excerpt(text: &str, at: usize, len: usize) -> String {
+fn excerpt(text: &str, at: usize, end_at: usize) -> String {
     let chars: Vec<(usize, char)> = text.char_indices().collect();
     let pos = chars.iter().position(|(i, _)| *i >= at).unwrap_or(0);
-    let matched = text[at..].chars().take(len.max(1)).count();
+    let matched = text[at..end_at].chars().count();
     let start = pos.saturating_sub(40);
     let end = (pos + matched + 60).min(chars.len());
     let mut s: String = chars[start..end].iter().map(|(_, c)| *c).collect();
@@ -619,7 +628,7 @@ mod tests {
             json!({"advisor": {"advisor": "big", "slave": "small"}}),
         )
         .unwrap();
-        w.append(&json!({"type":"user/message","data":{"content":[{"type":"text","text":"find the needle in haystack"}],"source":{"kind":"user"}}}));
+        w.append(&json!({"type":"user/message","data":{"content":[{"type":"text","text":"find the needle in haystack"}],"source":{"kind":"user"}}})).unwrap();
         let cp = child_path(&dir, "r1", "session-000002");
         let mut cw = SessionWriter::open_at_with(
             &cp,
@@ -630,7 +639,8 @@ mod tests {
             json!({"parent":"r1","root":"r1"}),
         )
         .unwrap();
-        cw.append(&json!({"type":"session/title","data":{"title":"worker"}}));
+        cw.append(&json!({"type":"session/title","data":{"title":"worker"}}))
+            .unwrap();
 
         let meta = read_meta(&root).unwrap();
         assert_eq!(meta.advisor, Some(("big".into(), "small".into())));
@@ -667,12 +677,30 @@ mod tests {
     fn excerpt_centres_on_the_match() {
         let t = "alpha beta gamma delta needle epsilon zeta";
         let at = t.find("needle").unwrap();
-        let e = excerpt(t, at, 6);
+        let e = excerpt(t, at, at + 6);
         assert!(e.contains("needle"));
         let long = format!("{} needle {}", "x".repeat(200), "y".repeat(200));
-        let e = excerpt(&long, long.find("needle").unwrap(), 6);
+        let at = long.find("needle").unwrap();
+        let e = excerpt(&long, at, at + 6);
         assert!(e.starts_with('…') && e.ends_with('…') && e.contains("needle"));
         assert!(e.chars().count() < 130);
+    }
+
+    #[test]
+    fn history_search_handles_length_changing_unicode() {
+        let root = std::env::temp_dir().join(format!("destro-search-{}", std::process::id()));
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let path = workspace.join("chat.jsonl");
+        let mut writer = SessionWriter::open_at(&path, "/w", "chat", "m", "destro").unwrap();
+        writer
+            .append(&json!({"type":"user/message","data":{"content":"İé東京"}}))
+            .unwrap();
+        drop(writer);
+        let hits = search_in(&root, "É東", 10);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].snippet, "İé東京");
     }
 
     #[test]
@@ -704,8 +732,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("s.jsonl");
         let mut w = SessionWriter::open_at(&p, "/w", "s1", "m", "destro").unwrap();
-        w.append(&json!({"type":"session/title","data":{"title":"hello"}}));
-        w.append(&json!({"type":"turn/start","data":{"turn":1}}));
+        w.append(&json!({"type":"session/title","data":{"title":"hello"}}))
+            .unwrap();
+        w.append(&json!({"type":"turn/start","data":{"turn":1}}))
+            .unwrap();
         let meta = read_meta(&p).unwrap();
         assert_eq!(
             (meta.title.as_str(), meta.turns, meta.id.as_str()),

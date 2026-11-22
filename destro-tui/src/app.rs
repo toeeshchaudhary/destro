@@ -496,6 +496,10 @@ impl App {
         match m {
             Msg::Frame { project, line } => self.on_frame(project, &line),
             Msg::Stderr { project, line } => self.projects[project].note(line),
+            Msg::SessionSaveFailed { project, message } => {
+                self.projects[project].note(message.clone());
+                self.flash(message);
+            }
             Msg::Balance(r) => {
                 let prev = match std::mem::replace(&mut self.balance, Balance::Loading) {
                     Balance::Ok { info, at } => Some((info, at)),
@@ -2848,7 +2852,7 @@ mod flow_tests {
             json!({"type":"user/message","data":{"content":[{"type":"text","text":"hello"}],"source":{"kind":"user"}}}),
             json!({"type":"assistant/message","data":{"message":{"content":[{"type":"text","text":"hi there"}]}}}),
         ] {
-            w.append(&ev);
+            w.append(&ev).unwrap();
         }
         let rec = Rec::default();
         let mut a = app(&rec);
@@ -3042,7 +3046,7 @@ mod flow_tests {
             json!({"advisor": {"advisor": "big", "slave": "small"}}),
         )
         .unwrap();
-        w.append(&json!({"type":"user/message","data":{"content":[{"type":"text","text":"plan it"}],"source":{"kind":"user"}}}));
+        w.append(&json!({"type":"user/message","data":{"content":[{"type":"text","text":"plan it"}],"source":{"kind":"user"}}})).unwrap();
         for (id, parent, title) in [
             ("session-000001", "r1", "worker A"),
             ("session-000002", "session-000001", "nested"),
@@ -3057,7 +3061,8 @@ mod flow_tests {
                 json!({"parent": parent, "root": "r1"}),
             )
             .unwrap();
-            cw.append(&json!({"type":"session/title","data":{"title":title}}));
+            cw.append(&json!({"type":"session/title","data":{"title":title}}))
+                .unwrap();
         }
         let rec = Rec::default();
         let mut a = app(&rec);

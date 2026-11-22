@@ -184,10 +184,68 @@ impl Local {
                 .register(Arc::new(SkillTool::new(found_skills)));
         }
         let mcp = McpHub::start(&root, harness.tools.clone(), rt.handle().clone());
-        let writers: Arc<Mutex<HashMap<String, SessionWriter>>> = Arc::default();
-        let pump_harness = harness.clone();
-        let pump_cwd = cwd.to_string();
         let sessions: Sessions = Arc::new(Mutex::new(Map::default()));
+        if persist {
+            let writers = Mutex::new(HashMap::new());
+            let weak_harness = Arc::downgrade(&harness);
+            let map = sessions.clone();
+            let cwd = cwd.to_string();
+            let out = tx.clone();
+            harness.bus.set_session_sink(move |agent, event| {
+                let Some(harness) = weak_harness.upgrade() else {
+                    return;
+                };
+                let Some(handle) = harness.get(agent) else {
+                    return;
+                };
+                let (session, parent, root) = {
+                    let map = map.lock().unwrap();
+                    let session = map.session_of(agent);
+                    let parent = handle.live.parent.map(|id| map.session_of(id));
+                    let mut root = agent;
+                    while let Some(id) = harness.get(root).and_then(|h| h.live.parent) {
+                        root = id;
+                    }
+                    (session, parent, map.session_of(root))
+                };
+                let mut writers = writers.lock().unwrap();
+                let writer = writers
+                    .entry((root.clone(), session.clone()))
+                    .or_insert_with(|| {
+                        Some(match &parent {
+                            Some(parent) => SessionWriter::open_child(
+                                &cwd,
+                                &root,
+                                &session,
+                                parent,
+                                &handle.live.model(),
+                            ),
+                            None => SessionWriter::open_with(
+                                &cwd,
+                                &session,
+                                &handle.live.model(),
+                                match &advisor {
+                                    Some((a, s)) => json!({"advisor": {"advisor": a, "slave": s}}),
+                                    None => json!({}),
+                                },
+                            ),
+                        })
+                    });
+                let result = match writer {
+                    Some(Ok(writer)) => writer.append(event).map_err(|error| error.to_string()),
+                    Some(Err(error)) => Err(error.to_string()),
+                    None => return,
+                };
+                if let Err(error) = result {
+                    // Stop after a failed write, which may have left a partial line.
+                    *writer = None;
+                    let _ = out.send(Msg::SessionSaveFailed {
+                        project: index,
+                        message: format!("Could not save session {session}: {error}"),
+                    });
+                }
+            });
+        }
         let mut rx = harness.subscribe();
         let out = tx.clone();
         let map = sessions.clone();
@@ -196,59 +254,6 @@ impl Local {
                 match rx.recv().await {
                     Ok(HarnessEvent::Session { agent, event, .. }) => {
                         let session = map.lock().unwrap().session_of(agent);
-                        // Every session is durable. Root sessions are filed by id;
-                        // subagents (whose ids restart each run) are filed under
-                        // their root as `<root>.sub.<child>`.
-                        if persist && let Some(h) = pump_harness.get(agent) {
-                            let key = match h.live.parent {
-                                None => session.clone(),
-                                Some(_) => {
-                                    let mut root = agent;
-                                    while let Some(p) =
-                                        pump_harness.get(root).and_then(|x| x.live.parent)
-                                    {
-                                        root = p;
-                                    }
-                                    format!("{}.sub.{session}", map.lock().unwrap().session_of(root))
-                                }
-                            };
-                            let mut w = writers.lock().unwrap();
-                            if !w.contains_key(&key) {
-                                let opened = match h.live.parent {
-                                    None => SessionWriter::open_with(
-                                        &pump_cwd,
-                                        &session,
-                                        &h.live.model(),
-                                        match &advisor {
-                                            Some((a, s)) => json!({"advisor": {"advisor": a, "slave": s}}),
-                                            None => json!({}),
-                                        },
-                                    ),
-                                    Some(parent) => {
-                                        let m = map.lock().unwrap();
-                                        let mut root = parent;
-                                        while let Some(p) =
-                                            pump_harness.get(root).and_then(|x| x.live.parent)
-                                        {
-                                            root = p;
-                                        }
-                                        SessionWriter::open_child(
-                                            &pump_cwd,
-                                            &m.session_of(root),
-                                            &session,
-                                            &m.session_of(parent),
-                                            &h.live.model(),
-                                        )
-                                    }
-                                };
-                                if let Ok(nw) = opened {
-                                    w.insert(key.clone(), nw);
-                                }
-                            }
-                            if let Some(wr) = w.get_mut(&key) {
-                                wr.append(&event);
-                            }
-                        }
                         emit(
                             &out,
                             index,
