@@ -162,10 +162,10 @@ impl ProviderRegistry {
 
     /// Where the config file lives, when the platform offers a config directory.
     pub fn path() -> Option<PathBuf> {
-        if cfg!(windows) {
-            if let Some(appdata) = env::var_os("APPDATA") {
-                return Some(PathBuf::from(appdata).join("destro").join("providers.json"));
-            }
+        if cfg!(windows)
+            && let Some(appdata) = env::var_os("APPDATA")
+        {
+            return Some(PathBuf::from(appdata).join("destro").join("providers.json"));
         }
         if let Some(xdg) = env::var_os("XDG_CONFIG_HOME") {
             return Some(PathBuf::from(xdg).join("destro").join("providers.json"));

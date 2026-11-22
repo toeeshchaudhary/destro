@@ -251,7 +251,7 @@ async fn inspector_reports_live_state() {
     let state = agent.state().await;
     assert_eq!(state.title.as_deref(), Some("inspector test"));
     assert_eq!(state.status, "running");
-    assert_eq!(state.transcript_len >= 2, true);
+    assert!(state.transcript_len >= 2);
 
     agent.wait().await;
     assert_eq!(h.state(agent.id).unwrap().status, "idle");

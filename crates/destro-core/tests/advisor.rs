@@ -146,7 +146,7 @@ async fn advisor_mode_fans_out_and_collects_parallel_workers() {
         .collect();
     assert_eq!(worker_ids.len(), 2, "both fire-and-forget workers exist");
     for id in worker_ids {
-        harness.wait(id).await;
+        let _ = harness.wait(id).await;
     }
     assert!(harness.list().iter().all(|a| a.status == "idle"));
 }

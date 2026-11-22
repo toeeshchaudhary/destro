@@ -216,10 +216,10 @@ impl HttpJob {
 
         // The transport may end without a trailing blank line.
         for event in parser.finish() {
-            if let SseEvent::Data(data) = event {
-                if !forward(state.handle_data(&data), tx, &cancel).await {
-                    return Ok(());
-                }
+            if let SseEvent::Data(data) = event
+                && !forward(state.handle_data(&data), tx, &cancel).await
+            {
+                return Ok(());
             }
         }
 
@@ -287,19 +287,19 @@ impl StreamState {
         };
 
         if let Some(delta) = choice.get("delta") {
-            if let Some(text) = delta.get("content").and_then(Value::as_str) {
-                if !text.is_empty() {
-                    out.push(ProviderItem::TextDelta(text.to_string()));
-                }
+            if let Some(text) = delta.get("content").and_then(Value::as_str)
+                && !text.is_empty()
+            {
+                out.push(ProviderItem::TextDelta(text.to_string()));
             }
             let reasoning = delta
                 .get("reasoning_content")
                 .or_else(|| delta.get("reasoning"))
                 .and_then(Value::as_str);
-            if let Some(text) = reasoning {
-                if !text.is_empty() {
-                    out.push(ProviderItem::ReasoningDelta(text.to_string()));
-                }
+            if let Some(text) = reasoning
+                && !text.is_empty()
+            {
+                out.push(ProviderItem::ReasoningDelta(text.to_string()));
             }
             if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
                 for (position, call) in calls.iter().enumerate() {
@@ -320,16 +320,16 @@ impl StreamState {
 
     fn absorb_tool_call(&mut self, index: u64, call: &Value) {
         let parts = self.tools.entry(index).or_default();
-        if let Some(id) = call.get("id").and_then(Value::as_str) {
-            if !id.is_empty() {
-                parts.id = id.to_string();
-            }
+        if let Some(id) = call.get("id").and_then(Value::as_str)
+            && !id.is_empty()
+        {
+            parts.id = id.to_string();
         }
         if let Some(function) = call.get("function") {
-            if let Some(name) = function.get("name").and_then(Value::as_str) {
-                if !name.is_empty() {
-                    parts.name = name.to_string();
-                }
+            if let Some(name) = function.get("name").and_then(Value::as_str)
+                && !name.is_empty()
+            {
+                parts.name = name.to_string();
             }
             if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
                 parts.arguments.push_str(arguments);

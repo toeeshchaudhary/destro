@@ -364,10 +364,10 @@ impl AgentHandle {
     /// A point-in-time inspector view.
     pub async fn state(&self) -> AgentState {
         let (tx, rx) = oneshot::channel();
-        if self.tx.try_send(Command::State(tx)).is_ok() {
-            if let Ok(state) = rx.await {
-                return state;
-            }
+        if self.tx.try_send(Command::State(tx)).is_ok()
+            && let Ok(state) = rx.await
+        {
+            return state;
         }
         // The task is gone; report what the shared cell still knows.
         self.live.snapshot(self.id)
