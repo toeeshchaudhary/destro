@@ -498,7 +498,24 @@ impl App {
     pub fn enter_advisor(&mut self) {
         self.mode = Mode::Advisor;
         if self.advisor.is_none() {
-            self.setup = Some(AdvisorSetup::from_suggestions(&self.model_suggestions));
+            let mut setup = AdvisorSetup::from_suggestions(&self.model_suggestions);
+            // Prefer a planner on refuseless and workers on deepseek when both
+            // are configured; the fields stay freely editable.
+            if let Some(v) = self
+                .model_suggestions
+                .iter()
+                .find(|s| s.starts_with("refuseless/"))
+            {
+                setup.models[0] = v.clone();
+            }
+            if let Some(v) = self
+                .model_suggestions
+                .iter()
+                .find(|s| s.starts_with("deepseek/"))
+            {
+                setup.models[1] = v.clone();
+            }
+            self.setup = Some(setup);
             self.flash("advisor mode: pick the planner and worker models".into());
         } else {
             self.flash("advisor mode".into());
